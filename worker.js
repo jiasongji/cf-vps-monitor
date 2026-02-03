@@ -17,7 +17,7 @@ const D1_SCHEMAS = {
       api_key TEXT NOT NULL UNIQUE,
       created_at INTEGER NOT NULL,
       sort_order INTEGER,
-      last_notified_down_at INTEGER DEFAULT NULL -- Timestamp of last "down" notification (1h interval for resend)
+      last_notified_down_at INTEGER DEFAULT NULL
     );
   `,
   metrics: `
@@ -28,7 +28,8 @@ const D1_SCHEMAS = {
       memory TEXT,
       disk TEXT,
       network TEXT,
-      uptime INTEGER, -- Added for server uptime in seconds
+      ping TEXT, -- 新增：存储丢包率数据
+      uptime INTEGER,
       FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
     );
   `,
@@ -43,7 +44,7 @@ const D1_SCHEMAS = {
       last_status_code INTEGER,
       last_response_time_ms INTEGER,
       sort_order INTEGER,
-      last_notified_down_at INTEGER DEFAULT NULL -- Timestamp of last "down" notification (1h interval for resend)
+      last_notified_down_at INTEGER DEFAULT NULL
     );
   `,
   site_status_history: `
@@ -60,13 +61,12 @@ const D1_SCHEMAS = {
   `,
   telegram_config: `
     CREATE TABLE IF NOT EXISTS telegram_config (
-      id INTEGER PRIMARY KEY CHECK (id = 1), -- Ensures only one row
+      id INTEGER PRIMARY KEY CHECK (id = 1),
       bot_token TEXT,
       chat_id TEXT,
-      enable_notifications INTEGER DEFAULT 0, -- 0 for false, 1 for true
+      enable_notifications INTEGER DEFAULT 0,
       updated_at INTEGER
     );
-    -- Initialize with a single row if it doesn't exist
     INSERT OR IGNORE INTO telegram_config (id, bot_token, chat_id, enable_notifications, updated_at) VALUES (1, NULL, NULL, 0, NULL);
   `,
   app_config: `
@@ -74,7 +74,6 @@ const D1_SCHEMAS = {
       key TEXT PRIMARY KEY,
       value TEXT
     );
-    -- Default VPS report interval: 60 seconds
     INSERT OR IGNORE INTO app_config (key, value) VALUES ('vps_report_interval_seconds', '60');
   `
 };
@@ -88,23 +87,15 @@ async function ensureTablesExist(db) {
     console.log("Database tables verified/created successfully.");
   } catch (error) {
     console.error("Error during initial table creation:", error);
-    // Proceed, as ALTER statements might fix things or might also fail if table creation itself failed badly.
   }
 
   // Attempt to add new columns to existing tables if they are missing
-  // These will fail if the columns already exist, which is fine.
   console.log("Attempting to apply schema alterations for new columns...");
   const alterStatements = [
-    // For monitored_sites table - ensure last_notified_down_at exists if it was added later
     "ALTER TABLE monitored_sites ADD COLUMN last_notified_down_at INTEGER DEFAULT NULL",
-    // For servers table - ensure last_notified_down_at exists if it was added later
     "ALTER TABLE servers ADD COLUMN last_notified_down_at INTEGER DEFAULT NULL",
-    // For metrics table - ensure uptime exists if it was added later
-    "ALTER TABLE metrics ADD COLUMN uptime INTEGER DEFAULT NULL"
-    // NOTE: Columns 'enable_frequent_down_notifications' and 'last_frequent_notified_down_at'
-    // are being removed from the schema. D1 does not easily support DROP COLUMN.
-    // Existing columns will be ignored by the application logic.
-    // New deployments won't create them.
+    "ALTER TABLE metrics ADD COLUMN uptime INTEGER DEFAULT NULL",
+    "ALTER TABLE metrics ADD COLUMN ping TEXT" // 新增 ping 字段
   ];
 
   for (const alterSql of alterStatements) {
@@ -113,45 +104,37 @@ async function ensureTablesExist(db) {
       console.log(`Successfully executed: ${alterSql}`);
     } catch (e) {
       if (e.message && (e.message.includes("duplicate column name") || e.message.includes("already exists"))) {
-        console.log(`Column in "${alterSql}" likely already exists (expected): ${e.message}`);
+        // Expected if column exists
       } else if (e.message && e.message.includes("no such table")) {
-        console.error(`Table for ALTER statement "${alterSql}" does not exist: ${e.message}`);
+        // Table doesn't exist yet, ignore
       } else {
         console.error(`Error executing ALTER statement "${alterSql}":`, e);
       }
     }
   }
-  console.log("Schema alterations attempt finished (new columns for frequent notifications are no longer added).");
 }
 
 
 // 处理API请求
-async function handleApiRequest(request, env, ctx) { // Added ctx
+async function handleApiRequest(request, env, ctx) {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
   
-  // CORS处理
   const corsHeaders = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key',
   };
-  
-  // 处理OPTIONS请求
+
   if (method === 'OPTIONS') {
-    return new Response(null, {
-      status: 204,
-      headers: corsHeaders
-    });
+    return new Response(null, { status: 204, headers: corsHeaders });
   }
   
   // 处理登录请求
   if (path === '/api/auth/login' && method === 'POST') {
     try {
       const { username, password } = await request.json();
-
-      // 从D1获取管理员凭证
       let stmt = env.DB.prepare('SELECT password FROM admin_credentials WHERE username = ?');
       let result = await stmt.bind(username).first();
 
@@ -159,43 +142,29 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
       if (result) {
         storedPassword = result.password;
       } else if (username === 'admin') {
-        // 如果是首次登录且用户是 'admin'，创建默认凭证
-        const defaultPassword = 'admin'; // 简化版本，不使用哈希
+        const defaultPassword = 'admin';
         try {
-          // 使用 INSERT OR IGNORE 避免并发问题
           await env.DB.prepare('INSERT OR IGNORE INTO admin_credentials (username, password) VALUES (?, ?)')
                       .bind('admin', defaultPassword)
                       .run();
           storedPassword = defaultPassword;
         } catch (dbError) {
-           // 如果表不存在，尝试创建表并插入 (仅适用于开发或首次部署)
-           // 注意：在生产环境中，表结构应预先创建好
            if (dbError.message.includes('no such table')) {
-             console.warn("Admin credentials table not found. Attempting to create...");
-             await env.DB.exec(`
-               CREATE TABLE IF NOT EXISTS admin_credentials (
-                 username TEXT PRIMARY KEY,
-                 password TEXT NOT NULL
-               );
-               INSERT OR IGNORE INTO admin_credentials (username, password) VALUES ('admin', 'admin');
-             `);
-             storedPassword = defaultPassword; // 假设创建成功
+             await env.DB.exec(D1_SCHEMAS.admin_credentials);
+             storedPassword = defaultPassword;
            } else {
-             throw dbError; // 重新抛出其他数据库错误
+             throw dbError;
            }
         }
       }
 
-      // 验证密码
       if (storedPassword && password === storedPassword) {
-        // 生成简单token
         const token = btoa(username + ':' + Date.now());
         return new Response(JSON.stringify({ token }), {
           headers: { 'Content-Type': 'application/json', ...corsHeaders }
         });
       }
 
-      // 验证失败
       return new Response(JSON.stringify({ error: 'Invalid credentials', message: '用户名或密码错误' }), {
         status: 401,
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -213,7 +182,6 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
   if (path === '/api/auth/status' && method === 'GET') {
     const authHeader = request.headers.get('Authorization');
     const authenticated = authHeader && authHeader.startsWith('Bearer ');
-    
     return new Response(JSON.stringify({ authenticated }), {
       headers: { 'Content-Type': 'application/json', ...corsHeaders }
     });
@@ -222,34 +190,20 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
   // 处理获取服务器列表 (Public)
   if (path === '/api/servers' && method === 'GET') {
     try {
-      // 从D1获取服务器列表 (按 sort_order 排序, NULLs last, 然后按 name)
       const stmt = env.DB.prepare('SELECT id, name, description FROM servers ORDER BY sort_order ASC NULLS LAST, name ASC');
       const { results } = await stmt.all();
-
       return new Response(JSON.stringify({ servers: results || [] }), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
        console.error("Get servers error:", error);
-       // 尝试创建表 (仅适用于开发或首次部署)
        if (error.message.includes('no such table')) {
-         console.warn("Servers table not found. Returning empty list and attempting to create...");
          try {
-           await env.DB.exec(`
-             CREATE TABLE IF NOT EXISTS servers (
-               id TEXT PRIMARY KEY,
-               name TEXT NOT NULL,
-               description TEXT,
-               api_key TEXT NOT NULL UNIQUE,
-               created_at INTEGER NOT NULL,
-               sort_order INTEGER
-             );
-           `);
-           return new Response(JSON.stringify({ servers: [] }), { // 返回空列表
+           await env.DB.exec(D1_SCHEMAS.servers);
+           return new Response(JSON.stringify({ servers: [] }), {
              headers: { 'Content-Type': 'application/json', ...corsHeaders }
            });
          } catch (createError) {
-            console.error("Failed to create servers table:", createError);
             return new Response(JSON.stringify({ error: 'Database error', message: createError.message }), {
               status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders }
             });
@@ -265,8 +219,6 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
   if (path.startsWith('/api/status/') && method === 'GET') {
     try {
       const serverId = path.split('/').pop();
-
-      // 从D1获取服务器信息
       const serverStmt = env.DB.prepare('SELECT id, name, description FROM servers WHERE id = ?');
       const serverData = await serverStmt.bind(serverId).first();
 
@@ -277,14 +229,12 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
         });
       }
 
-      // 从D1获取最新监控数据
-      // 注意：metrics表存储JSON字符串，直接取出
-      const metricsStmt = env.DB.prepare('SELECT timestamp, cpu, memory, disk, network, uptime FROM metrics WHERE server_id = ?');
+      // 获取 ping 字段
+      const metricsStmt = env.DB.prepare('SELECT timestamp, cpu, memory, disk, network, uptime, ping FROM metrics WHERE server_id = ?');
       const metricsResult = await metricsStmt.bind(serverId).first();
 
       let metricsData = null;
       if (metricsResult) {
-         // 解析存储的JSON字符串
          try {
             metricsData = {
                 timestamp: metricsResult.timestamp,
@@ -292,61 +242,31 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
                 memory: JSON.parse(metricsResult.memory || '{}'),
                 disk: JSON.parse(metricsResult.disk || '{}'),
                 network: JSON.parse(metricsResult.network || '{}'),
-                uptime: metricsResult.uptime // uptime is stored as INTEGER
+                ping: JSON.parse(metricsResult.ping || '{}'), // 解析 Ping
+                uptime: metricsResult.uptime
             };
          } catch (parseError) {
              console.error(`Error parsing metrics JSON for server ${serverId}:`, parseError);
-             // 可以选择返回错误或返回部分数据
-             metricsData = { timestamp: metricsResult.timestamp, uptime: metricsResult.uptime }; // 至少返回时间戳和uptime
+             metricsData = { timestamp: metricsResult.timestamp, uptime: metricsResult.uptime };
          }
       }
 
-
-      // 准备响应数据
       const responseData = {
-        server: serverData, // 包含 id, name, description
+        server: serverData,
         metrics: metricsData
       };
-
       return new Response(JSON.stringify(responseData), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
       console.error("Get status error:", error);
-       // 尝试创建表 (仅适用于开发或首次部署)
-       if (error.message.includes('no such table')) {
-         console.warn("Servers or metrics table not found. Attempting to create...");
+      if (error.message.includes('no such table')) {
          try {
-           await env.DB.exec(`
-             CREATE TABLE IF NOT EXISTS servers (
-               id TEXT PRIMARY KEY,
-               name TEXT NOT NULL,
-               description TEXT,
-               api_key TEXT NOT NULL UNIQUE,
-               created_at INTEGER NOT NULL,
-               sort_order INTEGER
-             );
-             CREATE TABLE IF NOT EXISTS metrics (
-               server_id TEXT PRIMARY KEY,
-               timestamp INTEGER,
-               cpu TEXT,
-               memory TEXT,
-               disk TEXT,
-               network TEXT,
-               uptime INTEGER,
-               FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
-             );
-           `);
-           // 返回 404 因为即使创建了表，数据也不存在
+           await env.DB.exec(D1_SCHEMAS.servers + D1_SCHEMAS.metrics);
             return new Response(JSON.stringify({ error: 'Server not found (tables created)' }), {
               status: 404, headers: { 'Content-Type': 'application/json', ...corsHeaders }
             });
-         } catch (createError) {
-            console.error("Failed to create tables:", createError);
-            return new Response(JSON.stringify({ error: 'Database error', message: createError.message }), {
-              status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders }
-            });
-         }
+         } catch (createError) {}
        }
       return new Response(JSON.stringify({ error: 'Internal server error', message: error.message }), {
         status: 500,
@@ -358,12 +278,10 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
   // 处理管理API - 获取所有服务器
   if (path === '/api/admin/servers' && method === 'GET') {
     try {
-      // 从D1获取所有服务器及其最新指标时间戳
-      // 使用 LEFT JOIN 来包含没有指标的服务器
       const stmt = env.DB.prepare(`
         SELECT 
           s.id, s.name, s.description, s.created_at, s.sort_order,
-          s.last_notified_down_at, -- Removed frequent notification fields
+          s.last_notified_down_at,
           m.timestamp as last_report
         FROM servers s
         LEFT JOIN metrics m ON s.id = m.server_id
@@ -376,38 +294,13 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
       });
     } catch (error) {
       console.error("Admin get servers error:", error);
-      // 尝试创建表 (仅适用于开发或首次部署)
-       if (error.message.includes('no such table')) {
-         console.warn("Servers or metrics table not found. Returning empty list and attempting to create...");
+      if (error.message.includes('no such table')) {
          try {
-           await env.DB.exec(`
-             CREATE TABLE IF NOT EXISTS servers (
-               id TEXT PRIMARY KEY,
-               name TEXT NOT NULL,
-               description TEXT,
-               api_key TEXT NOT NULL UNIQUE,
-               created_at INTEGER NOT NULL,
-               sort_order INTEGER
-             );
-             CREATE TABLE IF NOT EXISTS metrics (
-               server_id TEXT PRIMARY KEY,
-               timestamp INTEGER,
-               cpu TEXT,
-               memory TEXT,
-               disk TEXT,
-               network TEXT,
-               FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
-             );
-           `);
-           return new Response(JSON.stringify({ servers: [] }), { // 返回空列表
+           await env.DB.exec(D1_SCHEMAS.servers + D1_SCHEMAS.metrics);
+           return new Response(JSON.stringify({ servers: [] }), {
              headers: { 'Content-Type': 'application/json', ...corsHeaders }
            });
-         } catch (createError) {
-            console.error("Failed to create tables:", createError);
-            return new Response(JSON.stringify({ error: 'Database error', message: createError.message }), {
-              status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders }
-            });
-         }
+         } catch (createError) {}
        }
       return new Response(JSON.stringify({ error: 'Internal server error', message: error.message }), {
         status: 500,
@@ -419,9 +312,8 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
   // 处理管理API - 添加新服务器
   if (path === '/api/admin/servers' && method === 'POST') {
     try {
-      const { name, description } = await request.json(); // Removed enable_frequent_down_notifications
+      const { name, description } = await request.json();
 
-      // 验证输入
       if (!name) {
         return new Response(JSON.stringify({ error: 'Server name is required' }), {
           status: 400,
@@ -429,70 +321,44 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
         });
       }
 
-      // 生成服务器ID和API密钥
       const serverId = Math.random().toString(36).substring(2, 10);
-      const apiKey = Math.random().toString(36).substring(2, 15) +
-                     Math.random().toString(36).substring(2, 15);
+      const apiKey = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
       const createdAt = Math.floor(Date.now() / 1000);
 
-      // 获取当前最大的 sort_order
       const maxOrderStmt = env.DB.prepare('SELECT MAX(sort_order) as max_order FROM servers');
       const maxOrderResult = await maxOrderStmt.first();
       const nextSortOrder = (maxOrderResult && typeof maxOrderResult.max_order === 'number') ? maxOrderResult.max_order + 1 : 0;
-      // Removed enableFrequentNotificationsValue
 
-      // 保存服务器数据到D1
       const stmt = env.DB.prepare(
-        'INSERT INTO servers (id, name, description, api_key, created_at, sort_order) VALUES (?, ?, ?, ?, ?, ?)' // Removed enable_frequent_down_notifications
+        'INSERT INTO servers (id, name, description, api_key, created_at, sort_order) VALUES (?, ?, ?, ?, ?, ?)'
       );
-      await stmt.bind(serverId, name, description || '', apiKey, createdAt, nextSortOrder).run(); // Removed binding
+      await stmt.bind(serverId, name, description || '', apiKey, createdAt, nextSortOrder).run();
 
-      // 返回服务器数据（包含API密钥和 sort_order）
       const serverData = {
         id: serverId,
         name,
         description: description || '',
-        api_key: apiKey, // 返回密钥给管理员
+        api_key: apiKey,
         created_at: createdAt,
         sort_order: nextSortOrder
-        // Removed enable_frequent_down_notifications
       };
-
       return new Response(JSON.stringify({ server: serverData }), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
       console.error("Admin add server error:", error);
-      // 检查是否因为 UNIQUE constraint 失败 (不太可能，但以防万一)
       if (error.message.includes('UNIQUE constraint failed')) {
          return new Response(JSON.stringify({ error: 'Server ID or API Key conflict', message: '服务器ID或API密钥冲突，请重试' }), {
            status: 409, headers: { 'Content-Type': 'application/json', ...corsHeaders }
          });
       }
-      // 尝试创建表 (仅适用于开发或首次部署)
-       if (error.message.includes('no such table')) {
-         console.warn("Servers table not found. Attempting to create...");
+      if (error.message.includes('no such table')) {
          try {
-           await env.DB.exec(`
-             CREATE TABLE IF NOT EXISTS servers (
-               id TEXT PRIMARY KEY,
-               name TEXT NOT NULL,
-               description TEXT,
-               api_key TEXT NOT NULL UNIQUE,
-               created_at INTEGER NOT NULL,
-               sort_order INTEGER
-             );
-           `);
-           // 提示用户重试，因为表刚创建
+           await env.DB.exec(D1_SCHEMAS.servers);
             return new Response(JSON.stringify({ error: 'Database table created, please retry', message: '数据库表已创建，请重试添加操作' }), {
-              status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders } // Service Unavailable
+              status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders }
             });
-         } catch (createError) {
-            console.error("Failed to create servers table:", createError);
-            return new Response(JSON.stringify({ error: 'Database error', message: createError.message }), {
-              status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders }
-            });
-         }
+         } catch (createError) {}
        }
       return new Response(JSON.stringify({ error: 'Internal server error', message: error.message }), {
         status: 500,
@@ -505,8 +371,6 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
   if (path.match(/\/api\/admin\/servers\/[^\/]+$/) && method === 'DELETE') {
     try {
       const serverId = path.split('/').pop();
-
-      // D1 外键约束 (ON DELETE CASCADE) 会自动删除关联的 metrics 数据
       const stmt = env.DB.prepare('DELETE FROM servers WHERE id = ?');
       const info = await stmt.bind(serverId).run();
 
@@ -533,9 +397,8 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
   if (path.match(/\/api\/admin\/servers\/[^\/]+$/) && method === 'PUT') {
     try {
       const serverId = path.split('/').pop();
-      const { name, description } = await request.json(); // Removed enable_frequent_down_notifications
+      const { name, description } = await request.json();
 
-      // 验证输入
       if (!name) {
         return new Response(JSON.stringify({ error: 'Server name is required' }), {
           status: 400,
@@ -543,10 +406,6 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
         });
       }
 
-      // 更新D1中的服务器数据
-      // Construct the SET part of the query dynamically to only update provided fields
-      // For this specific case, we expect name, description, and enable_frequent_down_notifications
-      
       let setClauses = [];
       let bindings = [];
 
@@ -556,9 +415,8 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
       }
       if (description !== undefined) {
         setClauses.push("description = ?");
-        bindings.push(description || ''); // Ensure empty string if null/undefined
+        bindings.push(description || '');
       }
-      // Removed enable_frequent_down_notifications handling
 
       if (setClauses.length === 0) {
         return new Response(JSON.stringify({ error: 'No fields to update provided' }), {
@@ -567,7 +425,7 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
         });
       }
       
-      bindings.push(serverId); // Add serverId for the WHERE clause
+      bindings.push(serverId);
 
       const stmt = env.DB.prepare(
         `UPDATE servers SET ${setClauses.join(', ')} WHERE id = ?`
@@ -606,7 +464,6 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
         });
       }
 
-      // 从D1获取服务器API密钥
       const serverStmt = env.DB.prepare('SELECT api_key FROM servers WHERE id = ?');
       const serverData = await serverStmt.bind(serverId).first();
 
@@ -617,7 +474,6 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
         });
       }
 
-      // 验证API密钥
       if (serverData.api_key !== apiKey) {
         return new Response(JSON.stringify({ error: 'Invalid API key' }), {
           status: 401,
@@ -625,10 +481,7 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
         });
       }
 
-      // 解析上报的数据
       const reportData = await request.json();
-
-      // 验证数据格式
       if (!reportData.timestamp || !reportData.cpu || !reportData.memory || !reportData.disk || !reportData.network || typeof reportData.uptime === 'undefined') {
         return new Response(JSON.stringify({ error: 'Invalid data format, missing required fields including uptime' }), {
           status: 400,
@@ -636,11 +489,10 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
         });
       }
 
-      // 保存监控数据到D1 (使用REPLACE INTO进行插入或更新)
-      // 将复杂的对象字符串化存储
+      // 保存监控数据到D1 (包含 ping)
       const metricsStmt = env.DB.prepare(`
-        REPLACE INTO metrics (server_id, timestamp, cpu, memory, disk, network, uptime) 
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        REPLACE INTO metrics (server_id, timestamp, cpu, memory, disk, network, uptime, ping) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `);
       await metricsStmt.bind(
         serverId,
@@ -649,48 +501,21 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
         JSON.stringify(reportData.memory),
         JSON.stringify(reportData.disk),
         JSON.stringify(reportData.network),
-        reportData.uptime // uptime is an integer
+        reportData.uptime,
+        JSON.stringify(reportData.ping || {}) // 存储 ping 数据
       ).run();
-
       return new Response(JSON.stringify({ success: true }), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
       console.error("Report API error:", error);
-       // 尝试创建表 (仅适用于开发或首次部署)
        if (error.message.includes('no such table')) {
-         console.warn("Servers or metrics table not found. Attempting to create...");
          try {
-           await env.DB.exec(`
-             CREATE TABLE IF NOT EXISTS servers (
-               id TEXT PRIMARY KEY,
-               name TEXT NOT NULL,
-               description TEXT,
-               api_key TEXT NOT NULL UNIQUE,
-               created_at INTEGER NOT NULL,
-               sort_order INTEGER
-             );
-             CREATE TABLE IF NOT EXISTS metrics (
-               server_id TEXT PRIMARY KEY,
-               timestamp INTEGER,
-               cpu TEXT,
-               memory TEXT,
-               disk TEXT,
-               network TEXT,
-               uptime INTEGER,
-               FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
-             );
-           `);
-           // 提示需要重试，因为表刚创建，或者服务器可能不存在
+           await env.DB.exec(D1_SCHEMAS.servers + D1_SCHEMAS.metrics);
             return new Response(JSON.stringify({ error: 'Database table created or server not found, please retry or verify server ID/API Key', message: '数据库表已创建或服务器不存在，请重试或验证服务器ID/API密钥' }), {
-              status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders } // Service Unavailable
+              status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders }
             });
-         } catch (createError) {
-            console.error("Failed to create tables:", createError);
-            return new Response(JSON.stringify({ error: 'Database error', message: createError.message }), {
-              status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders }
-            });
-         }
+         } catch (createError) {}
        }
       return new Response(JSON.stringify({ error: 'Internal server error', message: error.message }), {
         status: 500,
@@ -702,9 +527,7 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
   // 处理管理API - 获取服务器的API密钥
   if (path.match(/\/api\/admin\/servers\/[^\/]+\/key$/) && method === 'GET') {
     try {
-      const serverId = path.split('/')[4]; // 获取路径中的 serverId
-
-      // 从D1获取API密钥
+      const serverId = path.split('/')[4];
       const stmt = env.DB.prepare('SELECT api_key FROM servers WHERE id = ?');
       const result = await stmt.bind(serverId).first();
 
@@ -730,8 +553,8 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
   // 处理管理API - 服务器排序
   if (path.match(/\/api\/admin\/servers\/[^\/]+\/reorder$/) && method === 'POST') {
     try {
-      const serverId = path.split('/')[4]; // 获取路径中的 serverId
-      const { direction } = await request.json(); // 'up' or 'down'
+      const serverId = path.split('/')[4];
+      const { direction } = await request.json();
 
       if (!direction || (direction !== 'up' && direction !== 'down')) {
         return new Response(JSON.stringify({ error: 'Invalid direction' }), {
@@ -739,15 +562,11 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
         });
       }
 
-      // 使用事务处理排序更新
       const results = await env.DB.batch([
-        // 获取所有服务器的 ID 和 sort_order，按当前顺序排列
         env.DB.prepare('SELECT id, sort_order FROM servers ORDER BY sort_order ASC NULLS LAST, name ASC')
       ]);
-
       const allServers = results[0].results;
       const currentIndex = allServers.findIndex(s => s.id === serverId);
-
       if (currentIndex === -1) {
         return new Response(JSON.stringify({ error: 'Server not found' }), {
           status: 404, headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -765,18 +584,15 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
         const currentServer = allServers[currentIndex];
         const targetServer = allServers[targetIndex];
 
-        // 确保 sort_order 是数字，如果为 null 则分配
         let currentOrder = currentServer.sort_order;
         let targetOrder = targetServer.sort_order;
 
-        // 如果任何一个 sort_order 为 null，需要重新分配所有 sort_order
         if (currentOrder === null || targetOrder === null) {
            console.warn("Reordering with NULL sort_order, re-assigning all orders.");
            const updateStmts = allServers.map((server, index) =>
              env.DB.prepare('UPDATE servers SET sort_order = ? WHERE id = ?').bind(index, server.id)
            );
            await env.DB.batch(updateStmts);
-           // 重新获取更新后的顺序
            const updatedResults = await env.DB.batch([
               env.DB.prepare('SELECT id, sort_order FROM servers ORDER BY sort_order ASC')
            ]);
@@ -785,18 +601,15 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
            let newTargetIndex = -1;
            if (direction === 'up' && newCurrentIndex > 0) newTargetIndex = newCurrentIndex - 1;
            else if (direction === 'down' && newCurrentIndex < updatedServers.length - 1) newTargetIndex = newCurrentIndex + 1;
-
            if (newTargetIndex !== -1) {
               currentOrder = updatedServers[newCurrentIndex].sort_order;
               targetOrder = updatedServers[newTargetIndex].sort_order;
-              // 交换这两个明确的顺序
               await env.DB.batch([
                 env.DB.prepare('UPDATE servers SET sort_order = ? WHERE id = ?').bind(targetOrder, serverId),
                 env.DB.prepare('UPDATE servers SET sort_order = ? WHERE id = ?').bind(currentOrder, updatedServers[newTargetIndex].id)
               ]);
            }
         } else {
-          // 如果都有 sort_order，直接交换
           await env.DB.batch([
             env.DB.prepare('UPDATE servers SET sort_order = ? WHERE id = ?').bind(targetOrder, serverId),
             env.DB.prepare('UPDATE servers SET sort_order = ? WHERE id = ?').bind(currentOrder, targetServer.id)
@@ -807,7 +620,6 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
       return new Response(JSON.stringify({ success: true }), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
-
     } catch (error) {
       console.error("Admin reorder server error:", error);
       return new Response(JSON.stringify({ error: 'Internal server error', message: error.message }), {
@@ -819,11 +631,9 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
   // 处理密码修改API
   if (path === '/api/auth/change-password' && method === 'POST') {
     try {
-      // 假设只有一个管理员 'admin'
       const adminUsername = 'admin';
       const { current_password, new_password } = await request.json();
 
-      // 验证输入
       if (!current_password || !new_password) {
         return new Response(JSON.stringify({ error: 'Current password and new password are required' }), {
           status: 400,
@@ -831,7 +641,6 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
         });
       }
 
-      // 从D1获取当前密码
       let stmt = env.DB.prepare('SELECT password FROM admin_credentials WHERE username = ?');
       let result = await stmt.bind(adminUsername).first();
 
@@ -842,7 +651,6 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
         });
       }
 
-      // 验证当前密码
       if (result.password !== current_password) {
         return new Response(JSON.stringify({ error: 'Current password is incorrect', message: '当前密码不正确' }), {
           status: 400,
@@ -850,7 +658,6 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
         });
       }
 
-      // 更新密码
       stmt = env.DB.prepare('UPDATE admin_credentials SET password = ? WHERE username = ?');
       await stmt.bind(new_password, adminUsername).run();
 
@@ -871,25 +678,20 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
   // 处理管理API - 获取监控站点列表
   if (path === '/api/admin/sites' && method === 'GET') {
     try {
-      // Order by sort_order, then name/url
-      const stmt = env.DB.prepare('SELECT id, name, url, added_at, last_checked, last_status, last_status_code, last_response_time_ms, sort_order, last_notified_down_at FROM monitored_sites ORDER BY sort_order ASC NULLS LAST, name ASC, url ASC'); // Removed enable_frequent_down_notifications
+      const stmt = env.DB.prepare('SELECT id, name, url, added_at, last_checked, last_status, last_status_code, last_response_time_ms, sort_order, last_notified_down_at FROM monitored_sites ORDER BY sort_order ASC NULLS LAST, name ASC, url ASC');
       const { results } = await stmt.all();
       return new Response(JSON.stringify({ sites: results || [] }), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
       console.error("Admin get sites error:", error);
-      // Basic table check/creation attempt
       if (error.message.includes('no such table')) {
-         console.warn("Monitored sites table not found. Returning empty list and attempting to create...");
          try {
            await env.DB.exec(D1_SCHEMAS.monitored_sites);
-           return new Response(JSON.stringify({ sites: [] }), { // Return empty list
+           return new Response(JSON.stringify({ sites: [] }), {
              headers: { 'Content-Type': 'application/json', ...corsHeaders }
            });
-         } catch (createError) {
-            console.error("Failed to create monitored_sites table:", createError);
-         }
+         } catch (createError) {}
        }
       return new Response(JSON.stringify({ error: 'Internal server error', message: error.message }), {
         status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -900,7 +702,7 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
   // 处理管理API - 添加监控站点
   if (path === '/api/admin/sites' && method === 'POST') {
     try {
-      const { url, name } = await request.json(); // Removed enable_frequent_down_notifications
+      const { url, name } = await request.json();
 
       if (!url || !isValidHttpUrl(url)) {
         return new Response(JSON.stringify({ error: 'Valid URL is required', message: '请输入有效的URL' }), {
@@ -908,19 +710,16 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
         });
       }
 
-      const siteId = Math.random().toString(36).substring(2, 12); // Longer ID
+      const siteId = Math.random().toString(36).substring(2, 12);
       const addedAt = Math.floor(Date.now() / 1000);
-
-      // Get current max sort_order for sites
       const maxOrderStmt = env.DB.prepare('SELECT MAX(sort_order) as max_order FROM monitored_sites');
       const maxOrderResult = await maxOrderStmt.first();
       const nextSortOrder = (maxOrderResult && typeof maxOrderResult.max_order === 'number') ? maxOrderResult.max_order + 1 : 0;
-      // Removed enableFrequentNotificationsValue
 
       const stmt = env.DB.prepare(
-        'INSERT INTO monitored_sites (id, url, name, added_at, last_status, sort_order) VALUES (?, ?, ?, ?, ?, ?)' // Removed enable_frequent_down_notifications
+        'INSERT INTO monitored_sites (id, url, name, added_at, last_status, sort_order) VALUES (?, ?, ?, ?, ?, ?)'
       );
-      await stmt.bind(siteId, url, name || '', addedAt, 'PENDING', nextSortOrder).run(); // Removed binding
+      await stmt.bind(siteId, url, name || '', addedAt, 'PENDING', nextSortOrder).run();
 
       const siteData = {
         id: siteId,
@@ -929,22 +728,17 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
         added_at: addedAt,
         last_status: 'PENDING',
         sort_order: nextSortOrder
-        // Removed enable_frequent_down_notifications
       };
-
-      // Immediately perform a health check for the new site
+      
       const newSiteForCheck = {
         id: siteId,
         url: url,
         name: name || ''
       };
-      // Use ctx.waitUntil to perform the check without blocking the response
       if (ctx && typeof ctx.waitUntil === 'function') {
         ctx.waitUntil(checkWebsiteStatus(newSiteForCheck, env.DB, ctx));
         console.log(`Scheduled immediate health check for new site: ${siteId} (${url})`);
       } else {
-        // Fallback if ctx.waitUntil is not available (e.g., local testing without full CF environment)
-        console.warn("ctx.waitUntil not available for immediate site check. Attempting direct call (may block).");
         checkWebsiteStatus(newSiteForCheck, env.DB, ctx).catch(e => console.error("Error during direct immediate site check:", e));
       }
 
@@ -958,17 +752,13 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
            status: 409, headers: { 'Content-Type': 'application/json', ...corsHeaders }
          });
       }
-      // Basic table check/creation attempt
       if (error.message.includes('no such table')) {
-         console.warn("Monitored sites table not found. Attempting to create...");
          try {
            await env.DB.exec(D1_SCHEMAS.monitored_sites);
-           return new Response(JSON.stringify({ error: 'Database table created, please retry', message: '数据库表已创建，请重试添加操作' }), {
+            return new Response(JSON.stringify({ error: 'Database table created, please retry', message: '数据库表已创建，请重试添加操作' }), {
               status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders }
             });
-         } catch (createError) {
-            console.error("Failed to create monitored_sites table:", createError);
-         }
+         } catch (createError) {}
        }
       return new Response(JSON.stringify({ error: 'Internal server error', message: error.message }), {
         status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -980,7 +770,7 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
   if (path.match(/\/api\/admin\/sites\/[^\/]+$/) && method === 'PUT') {
     try {
       const siteId = path.split('/').pop();
-      const { url, name } = await request.json(); // Removed enable_frequent_down_notifications
+      const { url, name } = await request.json();
 
       let setClauses = [];
       let bindings = [];
@@ -996,9 +786,8 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
       }
       if (name !== undefined) {
         setClauses.push("name = ?");
-        bindings.push(name || ''); // Ensure empty string if null/undefined
+        bindings.push(name || '');
       }
-      // Removed enable_frequent_down_notifications handling
       
       if (setClauses.length === 0) {
         return new Response(JSON.stringify({ error: 'No fields to update provided' }), {
@@ -1007,7 +796,7 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
         });
       }
 
-      bindings.push(siteId); // Add siteId for the WHERE clause
+      bindings.push(siteId);
 
       const stmt = env.DB.prepare(
         `UPDATE monitored_sites SET ${setClauses.join(', ')} WHERE id = ?`
@@ -1026,7 +815,6 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
       return new Response(JSON.stringify({ site: updatedSite }), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
-
     } catch (error) {
       console.error("Admin update site error:", error);
       if (error.message.includes('UNIQUE constraint failed')) {
@@ -1046,7 +834,6 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
       const siteId = path.split('/').pop();
       const stmt = env.DB.prepare('DELETE FROM monitored_sites WHERE id = ?');
       const info = await stmt.bind(siteId).run();
-
       if (info.changes === 0) {
         return new Response(JSON.stringify({ error: 'Site not found' }), {
           status: 404, headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -1067,8 +854,8 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
   // 处理管理API - 网站排序
   if (path.match(/\/api\/admin\/sites\/[^\/]+\/reorder$/) && method === 'POST') {
     try {
-      const siteId = path.split('/')[4]; // Get siteId from path
-      const { direction } = await request.json(); // 'up' or 'down'
+      const siteId = path.split('/')[4];
+      const { direction } = await request.json();
 
       if (!direction || (direction !== 'up' && direction !== 'down')) {
         return new Response(JSON.stringify({ error: 'Invalid direction' }), {
@@ -1076,13 +863,11 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
         });
       }
 
-      // Get all sites ordered correctly
       const results = await env.DB.batch([
         env.DB.prepare('SELECT id, sort_order FROM monitored_sites ORDER BY sort_order ASC NULLS LAST, name ASC, url ASC')
       ]);
       const allSites = results[0].results;
       const currentIndex = allSites.findIndex(s => s.id === siteId);
-
       if (currentIndex === -1) {
         return new Response(JSON.stringify({ error: 'Site not found' }), {
           status: 404, headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -1100,14 +885,12 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
         const currentSite = allSites[currentIndex];
         const targetSite = allSites[targetIndex];
 
-        // Handle potential NULL sort_order by re-assigning all if needed
         if (currentSite.sort_order === null || targetSite.sort_order === null) {
            console.warn("Reordering sites with NULL sort_order, re-assigning all orders.");
            const updateStmts = allSites.map((site, index) =>
              env.DB.prepare('UPDATE monitored_sites SET sort_order = ? WHERE id = ?').bind(index, site.id)
            );
            await env.DB.batch(updateStmts);
-           // Re-fetch updated orders to perform the swap correctly
            const updatedResults = await env.DB.batch([
               env.DB.prepare('SELECT id, sort_order FROM monitored_sites ORDER BY sort_order ASC')
            ]);
@@ -1116,7 +899,6 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
            let newTargetIndex = -1;
            if (direction === 'up' && newCurrentIndex > 0) newTargetIndex = newCurrentIndex - 1;
            else if (direction === 'down' && newCurrentIndex < updatedSites.length - 1) newTargetIndex = newCurrentIndex + 1;
-
            if (newTargetIndex !== -1) {
               const currentOrder = updatedSites[newCurrentIndex].sort_order;
               const targetOrder = updatedSites[newTargetIndex].sort_order;
@@ -1126,7 +908,6 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
               ]);
            }
         } else {
-          // Swap existing sort_order values
           await env.DB.batch([
             env.DB.prepare('UPDATE monitored_sites SET sort_order = ? WHERE id = ?').bind(targetSite.sort_order, siteId),
             env.DB.prepare('UPDATE monitored_sites SET sort_order = ? WHERE id = ?').bind(currentSite.sort_order, targetSite.id)
@@ -1137,7 +918,6 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
       return new Response(JSON.stringify({ success: true }), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
-
     } catch (error) {
       console.error("Admin reorder site error:", error);
       return new Response(JSON.stringify({ error: 'Internal server error', message: error.message }), {
@@ -1150,8 +930,6 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
   // 处理公共API - 获取所有监控站点状态 (URL removed)
   if (path === '/api/sites/status' && method === 'GET') {
      try {
-      // Select necessary fields for public view (NO URL)
-      // Order by sort_order, then name for public view consistency
       const stmt = env.DB.prepare('SELECT id, name, last_checked, last_status, last_status_code, last_response_time_ms FROM monitored_sites ORDER BY sort_order ASC NULLS LAST, name ASC, id ASC');
       const { results } = await stmt.all();
       return new Response(JSON.stringify({ sites: results || [] }), {
@@ -1159,17 +937,13 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
       });
     } catch (error) {
       console.error("Get sites status error:", error);
-       // Basic table check/creation attempt
       if (error.message.includes('no such table')) {
-         console.warn("Monitored sites table not found. Returning empty list and attempting to create...");
          try {
            await env.DB.exec(D1_SCHEMAS.monitored_sites);
-           return new Response(JSON.stringify({ sites: [] }), { // Return empty list
+           return new Response(JSON.stringify({ sites: [] }), {
              headers: { 'Content-Type': 'application/json', ...corsHeaders }
            });
-         } catch (createError) {
-            console.error("Failed to create monitored_sites table:", createError);
-         }
+         } catch (createError) {}
        }
       return new Response(JSON.stringify({ error: 'Internal server error', message: error.message }), {
         status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -1185,23 +959,20 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
     try {
       const stmt = env.DB.prepare('SELECT value FROM app_config WHERE key = ?');
       const result = await stmt.bind('vps_report_interval_seconds').first();
-      const interval = result ? parseInt(result.value, 10) : 60; // Default to 60 if not found
+      const interval = result ? parseInt(result.value, 10) : 60;
 
       return new Response(JSON.stringify({ interval: interval }), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
     } catch (error) {
       console.error("Get VPS report interval error:", error);
-      // Attempt to create table if it doesn't exist
       if (error.message.includes('no such table')) {
         try {
           await env.DB.exec(D1_SCHEMAS.app_config);
-          return new Response(JSON.stringify({ interval: 60 }), { // Return default
+          return new Response(JSON.stringify({ interval: 60 }), {
             headers: { 'Content-Type': 'application/json', ...corsHeaders }
           });
-        } catch (createError) {
-          console.error("Failed to create app_config table:", createError);
-        }
+        } catch (createError) {}
       }
       return new Response(JSON.stringify({ error: 'Internal server error', message: error.message }), {
         status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -1221,7 +992,6 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
 
       const stmt = env.DB.prepare('REPLACE INTO app_config (key, value) VALUES (?, ?)');
       await stmt.bind('vps_report_interval_seconds', interval.toString()).run();
-
       return new Response(JSON.stringify({ success: true, interval: interval }), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
       });
@@ -1245,16 +1015,13 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
       });
     } catch (error) {
       console.error("Get Telegram settings error:", error);
-      // Attempt to create table if it doesn't exist (should be handled by ensureTablesExist)
       if (error.message.includes('no such table')) {
         try {
           await env.DB.exec(D1_SCHEMAS.telegram_config);
           return new Response(JSON.stringify({ bot_token: null, chat_id: null, enable_notifications: 0 }), {
             headers: { 'Content-Type': 'application/json', ...corsHeaders }
           });
-        } catch (createError) {
-          console.error("Failed to create telegram_config table:", createError);
-        }
+        } catch (createError) {}
       }
       return new Response(JSON.stringify({ error: 'Internal server error', message: error.message }), {
         status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -1267,7 +1034,6 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
       const { bot_token, chat_id, enable_notifications } = await request.json();
       const updatedAt = Math.floor(Date.now() / 1000);
 
-      // Validate enable_notifications
       const enableNotifValue = (enable_notifications === true || enable_notifications === 1) ? 1 : 0;
 
       const stmt = env.DB.prepare(
@@ -1275,15 +1041,11 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
       );
       await stmt.bind(bot_token || null, chat_id || null, enableNotifValue, updatedAt).run();
       
-      // Send a test notification if enabled and configured
       if (enableNotifValue === 1 && bot_token && chat_id) {
-        const testMessage = "✅ Telegram 通知已在此监控面板激活。这是一条测试消息。"; // Translated
-        // We don't want to wait for this, so we use ctx.waitUntil if available, or just let it run
-        if (ctx && typeof ctx.waitUntil === 'function') { // Use ctx directly
+        const testMessage = "✅ Telegram 通知已在此监控面板激活。这是一条测试消息。";
+        if (ctx && typeof ctx.waitUntil === 'function') {
             ctx.waitUntil(sendTelegramNotification(env.DB, testMessage));
         } else {
-            // Fallback if ctx or waitUntil is not available (should not happen in standard CF worker env)
-            console.warn("ctx.waitUntil not available for sending test Telegram notification. Attempting direct call.");
             sendTelegramNotification(env.DB, testMessage).catch(e => console.error("Error sending test notification (direct call):", e));
         }
       }
@@ -1303,13 +1065,9 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
   // 处理公共API - 获取特定监控站点的24小时历史状态
   if (path.match(/\/api\/sites\/[^\/]+\/history$/) && method === 'GET') {
     try {
-      const siteId = path.split('/')[3]; // /api/sites/{siteId}/history
-
-      // Fetch last 24 status records for the site
-      // Fetch records from the last 24 hours for the site, newest first
+      const siteId = path.split('/')[3];
       const nowSeconds = Math.floor(Date.now() / 1000);
       const twentyFourHoursAgoSeconds = nowSeconds - (24 * 60 * 60);
-
       const stmt = env.DB.prepare(
         'SELECT timestamp, status, status_code, response_time_ms FROM site_status_history WHERE site_id = ? AND timestamp >= ? ORDER BY timestamp DESC'
       );
@@ -1320,17 +1078,13 @@ async function handleApiRequest(request, env, ctx) { // Added ctx
       });
     } catch (error) {
       console.error("Get site history error:", error);
-      // Basic table check/creation attempt (though ensureTablesExist should handle it)
       if (error.message.includes('no such table')) {
-         console.warn("site_status_history table not found. Returning empty list.");
          try {
-           await env.DB.exec(D1_SCHEMAS.site_status_history); // Attempt to create if missing
+           await env.DB.exec(D1_SCHEMAS.site_status_history);
            return new Response(JSON.stringify({ history: [] }), {
              headers: { 'Content-Type': 'application/json', ...corsHeaders }
            });
-         } catch (createError) {
-            console.error("Failed to create site_status_history table:", createError);
-         }
+         } catch (createError) {}
       }
       return new Response(JSON.stringify({ error: 'Internal server error', message: error.message }), {
         status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -1367,10 +1121,9 @@ async function sendTelegramNotification(db, message) {
       body: JSON.stringify({
         chat_id: config.chat_id,
         text: message,
-        parse_mode: 'Markdown' // Optional: for formatting
+        parse_mode: 'Markdown'
       })
     });
-
     if (!response.ok) {
       const errorData = await response.json();
       console.error(`Failed to send Telegram notification: ${response.status}`, errorData);
@@ -1383,19 +1136,17 @@ async function sendTelegramNotification(db, message) {
 }
 
 
-async function checkWebsiteStatus(site, db, ctx) { // Added ctx for waitUntil
-  const { id, url, name } = site; // Added name
+async function checkWebsiteStatus(site, db, ctx) {
+  const { id, url, name } = site;
   const startTime = Date.now();
-  let newStatus = 'PENDING'; // Renamed to newStatus to avoid conflict
-  let newStatusCode = null; // Renamed
-  let newResponseTime = null; // Renamed
-
-  // Get current status and last notification time from DB
+  let newStatus = 'PENDING';
+  let newStatusCode = null;
+  let newResponseTime = null;
   let previousStatus = 'PENDING';
   let siteLastNotifiedDownAt = null;
 
   try {
-    const siteDetailsStmt = db.prepare('SELECT last_status, last_notified_down_at FROM monitored_sites WHERE id = ?'); // Removed enable_frequent_down_notifications
+    const siteDetailsStmt = db.prepare('SELECT last_status, last_notified_down_at FROM monitored_sites WHERE id = ?');
     const siteDetailsResult = await siteDetailsStmt.bind(id).first();
     if (siteDetailsResult) {
       previousStatus = siteDetailsResult.last_status || 'PENDING';
@@ -1429,18 +1180,16 @@ async function checkWebsiteStatus(site, db, ctx) { // Added ctx for waitUntil
 
   const checkTime = Math.floor(Date.now() / 1000);
   const siteDisplayName = name || url;
-  let newSiteLastNotifiedDownAt = siteLastNotifiedDownAt; // Preserve by default
+  let newSiteLastNotifiedDownAt = siteLastNotifiedDownAt;
 
   if (['DOWN', 'TIMEOUT', 'ERROR'].includes(newStatus)) {
     const isFirstTimeDown = !['DOWN', 'TIMEOUT', 'ERROR'].includes(previousStatus);
     if (isFirstTimeDown) {
-      // Site just went down
       const message = `🔴 网站故障: *${siteDisplayName}* 当前状态 ${newStatus.toLowerCase()} (状态码: ${newStatusCode || '无'}).\n网址: ${url}`;
       ctx.waitUntil(sendTelegramNotification(db, message));
       newSiteLastNotifiedDownAt = checkTime;
       console.log(`网站 ${siteDisplayName} 刚刚故障。已发送初始通知。last_notified_down_at 已更新。`);
     } else {
-      // Site is still down, check if 1-hour interval has passed for resend
       const shouldResend = siteLastNotifiedDownAt === null || (checkTime - siteLastNotifiedDownAt > NOTIFICATION_INTERVAL_SECONDS);
       if (shouldResend) {
         const message = `🔴 网站持续故障: *${siteDisplayName}* 状态 ${newStatus.toLowerCase()} (状态码: ${newStatusCode || '无'}).\n网址: ${url}`;
@@ -1452,10 +1201,9 @@ async function checkWebsiteStatus(site, db, ctx) { // Added ctx for waitUntil
       }
     }
   } else if (newStatus === 'UP' && ['DOWN', 'TIMEOUT', 'ERROR'].includes(previousStatus)) {
-    // Site just came back up
     const message = `✅ 网站恢复: *${siteDisplayName}* 已恢复在线!\n网址: ${url}`;
     ctx.waitUntil(sendTelegramNotification(db, message));
-    newSiteLastNotifiedDownAt = null; // Clear notification timestamp as site is up
+    newSiteLastNotifiedDownAt = null; 
     console.log(`网站 ${siteDisplayName} 已恢复。已发送通知。last_notified_down_at 已清除。`);
   }
 
@@ -1467,7 +1215,6 @@ async function checkWebsiteStatus(site, db, ctx) { // Added ctx for waitUntil
     const recordHistoryStmt = db.prepare(
       'INSERT INTO site_status_history (site_id, timestamp, status, status_code, response_time_ms) VALUES (?, ?, ?, ?, ?)'
     );
-    
     await db.batch([
       updateSiteStmt.bind(checkTime, newStatus, newStatusCode, newResponseTime, newSiteLastNotifiedDownAt, id),
       recordHistoryStmt.bind(id, checkTime, newStatus, newStatusCode, newResponseTime)
@@ -1481,21 +1228,18 @@ async function checkWebsiteStatus(site, db, ctx) { // Added ctx for waitUntil
 // Combine fetch and scheduled handlers into a single default export
 export default {
   async fetch(request, env, ctx) {
-    // Ensure tables exist on first request (or periodically)
-    // Using ctx.waitUntil to not block the response
     ctx.waitUntil(ensureTablesExist(env.DB));
-
     const url = new URL(request.url);
     const path = url.pathname;
 
     // API requests
     if (path.startsWith('/api/')) {
-      return handleApiRequest(request, env, ctx); // Pass ctx
+      return handleApiRequest(request, env, ctx);
     }
 
     // Install script
     if (path === '/install.sh') {
-      return handleInstallScript(request, url);
+      return handleInstallScript(request, url, env);
     }
 
     // Frontend static files
@@ -1507,7 +1251,6 @@ export default {
     ctx.waitUntil(
       (async () => {
         try {
-      // Ensure table exists before proceeding
       await ensureTablesExist(env.DB);
 
       // --- Part 1: Website Monitoring ---
@@ -1538,19 +1281,17 @@ export default {
       console.log("开始计划的VPS状态检查以发送通知...");
       const serverConfigStmt = env.DB.prepare('SELECT bot_token, chat_id, enable_notifications FROM telegram_config WHERE id = 1');
       const telegramConfig = await serverConfigStmt.first();
-
       if (!telegramConfig || !telegramConfig.enable_notifications || !telegramConfig.bot_token || !telegramConfig.chat_id) {
         console.log("VPS的Telegram通知已禁用或未配置。跳过VPS检查。");
-        return; // Exit if Telegram is not set up
+        return;
       }
       
       const serverStmt = env.DB.prepare(`
         SELECT s.id, s.name, s.last_notified_down_at, m.timestamp as last_report
         FROM servers s
         LEFT JOIN metrics m ON s.id = m.server_id
-      `); // Removed frequent notification fields
+      `);
       const { results: serversToCheck } = await serverStmt.all();
-
       if (!serversToCheck || serversToCheck.length === 0) {
         console.log("未找到用于VPS状态检查的服务器。");
         return;
@@ -1567,7 +1308,6 @@ export default {
         const lastReportTimeStr = server.last_report ? new Date(server.last_report * 1000).toLocaleString('zh-CN') : '从未';
 
         if (isStale) {
-          // Server is considered down/stale
           const shouldSendNotification = server.last_notified_down_at === null || (nowSeconds - server.last_notified_down_at > NOTIFICATION_INTERVAL_SECONDS);
           if (shouldSendNotification) {
             const message = `🔴 VPS 故障: 服务器 *${serverDisplayName}* 似乎已离线。最后报告: ${lastReportTimeStr}.`;
@@ -1579,22 +1319,18 @@ export default {
             console.log(`VPS ${serverDisplayName} 状态陈旧，但1小时通知间隔未到。`);
           }
         } else {
-          // Server is reporting (online)
           if (server.last_notified_down_at !== null) {
-            // Was previously notified as down, now it's recovered
             const message = `✅ VPS 恢复: 服务器 *${serverDisplayName}* 已恢复在线并正在报告。当前报告: ${lastReportTimeStr}.`;
             ctx.waitUntil(sendTelegramNotification(env.DB, message));
             const updateStmt = env.DB.prepare('UPDATE servers SET last_notified_down_at = NULL WHERE id = ?');
             ctx.waitUntil(updateStmt.bind(server.id).run());
             console.log(`VPS ${serverDisplayName} 已恢复。已发送通知。last_notified_down_at 已清除。`);
           } else {
-            // Was online, still online. No action needed.
              console.log(`VPS ${serverDisplayName} 在线并正在报告。无需通知。`);
           }
         }
       }
       console.log("VPS状态检查以发送通知已完成。");
-
     } catch (error) {
       console.error("计划任务期间发生错误:", error);
     }
@@ -1602,11 +1338,8 @@ export default {
 );
 }
 };
-
-
 // --- Utility Functions ---
 
-// Basic HTTP/HTTPS URL validation
 function isValidHttpUrl(string) {
   let url;
   try {
@@ -1621,19 +1354,15 @@ function isValidHttpUrl(string) {
 // --- Original Handlers (Install Script, Frontend) ---
 
 // 处理安装脚本
-async function handleInstallScript(request, url, env) { // Added env
+// 处理安装脚本
+// 处理安装脚本
+async function handleInstallScript(request, url, env) {
   const baseUrl = url.origin;
-  let vpsReportInterval = '60'; // Default
+  let vpsReportInterval = '60';
 
   try {
-    // Ensure app_config table exists before trying to read from it.
-    // This might be redundant if ensureTablesExist runs reliably on every fetch,
-    // but good for robustness within this specific function.
-    // Check if D1_SCHEMAS.app_config is defined before executing
     if (D1_SCHEMAS && D1_SCHEMAS.app_config) {
         await env.DB.exec(D1_SCHEMAS.app_config);
-    } else {
-        console.warn("D1_SCHEMAS.app_config is not defined. Skipping creation in handleInstallScript.");
     }
     
     const stmt = env.DB.prepare('SELECT value FROM app_config WHERE key = ?');
@@ -1646,7 +1375,6 @@ async function handleInstallScript(request, url, env) { // Added env
     }
   } catch (e) {
     console.error("Error fetching VPS report interval for install script:", e);
-    // Use default if error, or if table/value doesn't exist yet
   }
   
   const script = `#!/bin/bash
@@ -1706,26 +1434,134 @@ echo "Worker URL: $WORKER_URL"
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR" || exit 1
 
-# 创建监控脚本
+# ==========================================
+# 1. 创建 Python TCPing 守护进程脚本
+# ==========================================
+cat > "$INSTALL_DIR/ping_daemon.py" << 'PYTHONEOF'
+import socket
+import time
+import json
+import threading
+import sys
+from collections import deque
+
+# 配置目标
+TARGETS = {
+    "cu": "www.tynews.com.cn",
+    "ct": "www.chinaccs.cn",
+    "cm": "sx.10086.cn"
+}
+PORT = 80
+HISTORY_LEN = 100
+INTERVAL = 2  # 每次Ping的间隔(秒)
+OUTPUT_FILE = "/tmp/vps_monitor_ping.json"
+
+# 存储历史记录 (True=通, False=丢)
+history = {
+    "cu": deque(maxlen=HISTORY_LEN),
+    "ct": deque(maxlen=HISTORY_LEN),
+    "cm": deque(maxlen=HISTORY_LEN)
+}
+
+def tcp_ping(host, port):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1.5)
+        start = time.time()
+        s.connect((host, port))
+        s.close()
+        return True
+    except:
+        return False
+
+def worker(carrier, host):
+    while True:
+        result = tcp_ping(host, PORT)
+        history[carrier].append(result)
+        time.sleep(INTERVAL)
+
+def data_writer():
+    while True:
+        data = {}
+        for carrier, q in history.items():
+            if len(q) == 0:
+                data[carrier] = 0
+            else:
+                # 计算丢包率 (失败次数 / 总次数 * 100)
+                lost_count = list(q).count(False)
+                loss_rate = int((lost_count / len(q)) * 100)
+                data[carrier] = loss_rate
+        
+        try:
+            with open(OUTPUT_FILE, 'w') as f:
+                json.dump(data, f)
+        except:
+            pass
+        time.sleep(5)
+
+# 启动线程
+for carrier, host in TARGETS.items():
+    t = threading.Thread(target=worker, args=(carrier, host))
+    t.daemon = True
+    t.start()
+
+# 启动写入线程
+writer = threading.Thread(target=data_writer)
+writer.daemon = True
+writer.start()
+
+# 保持主线程运行
+while True:
+    time.sleep(60)
+PYTHONEOF
+
+# ==========================================
+# 2. 创建主监控脚本 monitor.sh
+# ==========================================
 cat > "$INSTALL_DIR/monitor.sh" << 'EOF'
 #!/bin/bash
+
+# 获取脚本所在目录，防止 Systemd 启动时路径错误
+WORKDIR=$(dirname "$(readlink -f "$0")")
+cd "$WORKDIR" || exit 1
 
 # 配置
 API_KEY="__API_KEY__"
 SERVER_ID="__SERVER_ID__"
 WORKER_URL="__WORKER_URL__"
-INTERVAL=${vpsReportInterval}  # 上报间隔（秒）
+INTERVAL=${vpsReportInterval}
+
+# 确保 Python 守护进程在运行
+check_ping_daemon() {
+    if ! pgrep -f "ping_daemon.py" > /dev/null; then
+        nohup python3 "$WORKDIR/ping_daemon.py" > /dev/null 2>&1 &
+    fi
+}
+
+# 读取 Ping 数据
+get_ping_data() {
+    if [ -f "/tmp/vps_monitor_ping.json" ]; then
+        cat "/tmp/vps_monitor_ping.json"
+    else
+        echo '{"cu":0,"ct":0,"cm":0}'
+    fi
+}
 
 # 日志函数
 log() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
 }
 
-# 获取CPU使用率
+# 获取正常运行时间 (uptime)
+get_uptime() {
+  cat /proc/uptime | awk '{print $1}' | cut -d. -f1
+}
+
+# 获取CPU使用率 (注意引号转义)
 get_cpu_usage() {
   cpu_usage=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\\([0-9.]*\\)%* id.*/\\1/" | awk '{print 100 - $1}')
   cpu_load=$(cat /proc/loadavg | awk '{print $1","$2","$3}')
-  echo "{\"usage_percent\":$cpu_usage,\"load_avg\":[$cpu_load]}"
+  echo "{\\"usage_percent\\":$cpu_usage,\\"load_avg\\":[$cpu_load]}"
 }
 
 # 获取内存使用情况
@@ -1734,7 +1570,7 @@ get_memory_usage() {
   used=$(free -k | grep Mem | awk '{print $3}')
   free=$(free -k | grep Mem | awk '{print $4}')
   usage_percent=$(echo "scale=1; $used * 100 / $total" | bc)
-  echo "{\"total\":$total,\"used\":$used,\"free\":$free,\"usage_percent\":$usage_percent}"
+  echo "{\\"total\\":$total,\\"used\\":$used,\\"free\\":$free,\\"usage_percent\\":$usage_percent}"
 }
 
 # 获取硬盘使用情况
@@ -1744,7 +1580,7 @@ get_disk_usage() {
   used=$(echo "$disk_info" | awk '{print $3 / 1024 / 1024}')
   free=$(echo "$disk_info" | awk '{print $4 / 1024 / 1024}')
   usage_percent=$(echo "$disk_info" | awk '{print $5}' | tr -d '%')
-  echo "{\"total\":$total,\"used\":$used,\"free\":$free,\"usage_percent\":$usage_percent}"
+  echo "{\\"total\\":$total,\\"used\\":$used,\\"free\\":$free,\\"usage_percent\\":$usage_percent}"
 }
 
 # 获取网络使用情况
@@ -1752,7 +1588,7 @@ get_network_usage() {
   # 检查是否安装了ifstat
   if ! command -v ifstat &> /dev/null; then
     log "ifstat未安装，无法获取网络速度"
-    echo "{\"upload_speed\":0,\"download_speed\":0,\"total_upload\":0,\"total_download\":0}"
+    echo "{\\"upload_speed\\":0,\\"download_speed\\":0,\\"total_upload\\":0,\\"total_download\\":0}"
     return
   fi
   
@@ -1768,23 +1604,26 @@ get_network_usage() {
   rx_bytes=$(cat /proc/net/dev | grep "$interface" | awk '{print $2}')
   tx_bytes=$(cat /proc/net/dev | grep "$interface" | awk '{print $10}')
   
-  echo "{\"upload_speed\":$upload_speed,\"download_speed\":$download_speed,\"total_upload\":$tx_bytes,\"total_download\":$rx_bytes}"
+  echo "{\\"upload_speed\\":$upload_speed,\\"download_speed\\":$download_speed,\\"total_upload\\":$tx_bytes,\\"total_download\\":$rx_bytes}"
 }
 
 # 上报数据
 report_metrics() {
+  # 检查守护进程
+  check_ping_daemon
+
   timestamp=$(date +%s)
   cpu=$(get_cpu_usage)
   memory=$(get_memory_usage)
   disk=$(get_disk_usage)
   network=$(get_network_usage)
+  ping=$(get_ping_data)
+  uptime=$(get_uptime)
   
-  data="{\"timestamp\":$timestamp,\"cpu\":$cpu,\"memory\":$memory,\"disk\":$disk,\"network\":$network}"
+  # 组装 JSON (关键：加入了 uptime，并保持双重转义 \\")
+  data="{\\"timestamp\\":$timestamp,\\"cpu\\":$cpu,\\"memory\\":$memory,\\"disk\\":$disk,\\"network\\":$network,\\"ping\\":$ping,\\"uptime\\":$uptime}"
   
-  log "正在上报数据..."
-  log "API密钥: $API_KEY"
-  log "服务器ID: $SERVER_ID"
-  log "Worker URL: $WORKER_URL"
+  # log "上报数据: $data"
   
   response=$(curl -s -X POST "$WORKER_URL/api/report/$SERVER_ID" \
     -H "Content-Type: application/json" \
@@ -1812,9 +1651,9 @@ install_dependencies() {
     return 1
   fi
   
-  # 安装依赖
+  # 安装依赖 (增加 python3)
   $PKG_MANAGER update -y
-  $PKG_MANAGER install -y bc curl ifstat
+  $PKG_MANAGER install -y bc curl ifstat python3
   
   log "依赖安装完成"
   return 0
@@ -1826,6 +1665,9 @@ main() {
   
   # 安装依赖
   install_dependencies
+  
+  # 启动 Python 守护进程
+  nohup python3 "$WORKDIR/ping_daemon.py" > /dev/null 2>&1 &
   
   # 主循环
   while true; do
@@ -1842,8 +1684,8 @@ EOF
 sed -i "s|__API_KEY__|$API_KEY|g" "$INSTALL_DIR/monitor.sh"
 sed -i "s|__SERVER_ID__|$SERVER_ID|g" "$INSTALL_DIR/monitor.sh"
 sed -i "s|__WORKER_URL__|$WORKER_URL|g" "$INSTALL_DIR/monitor.sh"
-# This line ensures the INTERVAL placeholder is replaced with the fetched value.
 sed -i "s|^INTERVAL=.*|INTERVAL=${vpsReportInterval}|g" "$INSTALL_DIR/monitor.sh"
+sed -i "s|__INSTALL_DIR__|$INSTALL_DIR|g" "$INSTALL_DIR/monitor.sh"
 
 # 设置执行权限
 chmod +x "$INSTALL_DIR/monitor.sh"
@@ -1875,7 +1717,6 @@ echo "服务已启动并设置为开机自启"
 echo "查看服务状态: systemctl status $SERVICE_NAME"
 echo "查看服务日志: journalctl -u $SERVICE_NAME -f"
 `;
-
   return new Response(script, {
     headers: {
       'Content-Type': 'text/plain',
@@ -1947,189 +1788,69 @@ function getIndexHtml() {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>VPS监控面板</title>
+    <title>Uptime Status</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.8.1/font/bootstrap-icons.css" rel="stylesheet">
     <link href="/css/style.css" rel="stylesheet">
     <style>
-        .server-row {
-            cursor: pointer; /* Indicate clickable rows */
-        }
-        .server-details-row {
-            /* display: none; /* Initially hidden - controlled by JS */ */
-        }
-        .server-details-row td {
-            padding: 1rem;
-            background-color: #f8f9fa; /* Light background for details */
-        }
-        .server-details-content {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1rem;
-        }
-        .detail-item {
-            background-color: #e9ecef;
-            padding: 0.75rem;
-            border-radius: 0.25rem;
-        }
-        .detail-item strong {
-            display: block;
-            margin-bottom: 0.25rem;
-        }
-        .history-bar-container {
-            display: inline-flex; /* Changed to inline-flex for centering within td */
-            flex-direction: row-reverse; /* Newest on the right */
-            align-items: center;
-            justify-content: center; /* Center the bars within this container */
-            height: 25px; /* Increased height */
-            gap: 2px; /* Space between bars */
-        }
-        .history-bar {
-            width: 8px; /* Increased width of each bar */
-            height: 100%;
-            /* margin-left: 1px; /* Replaced by gap */
-            border-radius: 1px;
-        }
-        .history-bar-up { background-color: #28a745; } /* Green */
-        .history-bar-down { background-color: #dc3545; } /* Red */
-        .history-bar-pending { background-color: #6c757d; } /* Gray */
-
-        /* Default styling for progress bar text (light mode) */
-        .progress span {
-            color: #000000; /* Black text for progress bars by default */
-            /* font-weight: bold; is handled by inline style in JS */
-        }
-
-        /* Center the "24h记录" (site table) and "上传" (server table) headers and their data cells */
-        .table > thead > tr > th:nth-child(6), /* Targets 6th header in both tables */
-        #siteStatusTableBody tr > td:nth-child(6), /* Targets 6th data cell in site status table */
-        #serverTableBody tr > td:nth-child(6) { /* Targets 6th data cell in server status table */
-            text-align: center;
-        }
+        .server-row { cursor: pointer; }
+        .server-details-row td { padding: 1rem; background-color: #f8f9fa; }
+        .server-details-content { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; }
+        .detail-item { background-color: #e9ecef; padding: 0.75rem; border-radius: 0.25rem; }
+        .detail-item strong { display: block; margin-bottom: 0.25rem; }
+        .history-bar-container { display: inline-flex; flex-direction: row-reverse; align-items: center; justify-content: center; height: 25px; gap: 2px; }
+        .history-bar { width: 8px; height: 100%; border-radius: 1px; }
+        .history-bar-up { background-color: #28a745; } 
+        .history-bar-down { background-color: #dc3545; } 
+        .history-bar-pending { background-color: #6c757d; } 
+        .progress span { color: #000000; }
+        .table > thead > tr > th:nth-child(6), 
+        #siteStatusTableBody tr > td:nth-child(6), 
+        #serverTableBody tr > td:nth-child(6) { text-align: center; }
 
         /* Dark Theme Adjustments */
-        [data-bs-theme="dark"] body {
-            background-color: #212529 !important; /* Bootstrap dark bg */
-            color: #ffffff !important; /* White text for dark mode */
-        }
-        [data-bs-theme="dark"] h1, [data-bs-theme="dark"] h2, [data-bs-theme="dark"] h3, [data-bs-theme="dark"] h4, [data-bs-theme="dark"] h5, [data-bs-theme="dark"] h6 {
-            color: #ffffff; /* White color for headings */
-        }
-        [data-bs-theme="dark"] a:not(.btn):not(.nav-link):not(.dropdown-item):not(.navbar-brand) {
-            color: #87cefa; /* LightSkyBlue for general links, good contrast on dark */
-        }
-        [data-bs-theme="dark"] a:not(.btn):not(.nav-link):not(.dropdown-item):not(.navbar-brand):hover {
-            color: #add8e6; /* Lighter blue on hover */
-        }
-        [data-bs-theme="dark"] .navbar-dark {
-            background-color: #343a40 !important; /* Darker navbar */
-        }
-        [data-bs-theme="dark"] .table {
-            color: #ffffff; /* White table text */
-        }
-        [data-bs-theme="dark"] .table-striped > tbody > tr:nth-of-type(odd) > * {
-            --bs-table-accent-bg: rgba(255, 255, 255, 0.05); /* Darker stripe */
-            color: #ffffff; /* Ensure text in striped rows is white */
-        }
-        [data-bs-theme="dark"] .table-hover > tbody > tr:hover > * {
-            --bs-table-accent-bg: rgba(255, 255, 255, 0.075); /* Darker hover */
-            color: #ffffff; /* Ensure text in hovered rows is white */
-        }
-        [data-bs-theme="dark"] .server-details-row td {
-            background-color: #343a40; /* Darker details background */
-            border-top: 1px solid #495057;
-        }
-        [data-bs-theme="dark"] .detail-item {
-            background-color: #495057; /* Darker detail item background */
-            color: #ffffff; /* White text for detail items */
-        }
-        [data-bs-theme="dark"] .progress {
-            background-color: #495057; /* Darker progress bar background */
-        }
-        [data-bs-theme="dark"] .progress span { /* Text on progress bar */
-            color: #000000 !important; /* Black text for progress bars */
-            text-shadow: none; /* Remove shadow for black text or use a very light one if needed */
-        }
-        [data-bs-theme="dark"] .footer.bg-light {
-            background-color: #343a40 !important; /* Darker footer */
-            border-top: 1px solid #495057;
-        }
-        [data-bs-theme="dark"] .footer .text-muted {
-            color: #adb5bd !important; /* Lighter muted text */
-        }
-        [data-bs-theme="dark"] .alert-info {
-            background-color: #17a2b8; /* Bootstrap info color, adjust if needed */
-            color: #fff;
-            border-color: #17a2b8;
-        }
-        [data-bs-theme="dark"] .btn-outline-light {
-            color: #f8f9fa;
-            border-color: #f8f9fa;
-        }
-        [data-bs-theme="dark"] .btn-outline-light:hover {
-            color: #212529;
-            background-color: #f8f9fa;
-        }
-        [data-bs-theme="dark"] .card {
-            background-color: #343a40;
-            border: 1px solid #495057;
-        }
-        [data-bs-theme="dark"] .card-header {
-            background-color: #495057;
-            border-bottom: 1px solid #5b6167;
-        }
-        [data-bs-theme="dark"] .modal-content {
-            background-color: #343a40;
-            color: #ffffff; /* White modal text */
-        }
-        [data-bs-theme="dark"] .modal-header {
-            border-bottom-color: #495057;
-        }
-        [data-bs-theme="dark"] .modal-footer {
-            border-top-color: #495057;
-        }
-        [data-bs-theme="dark"] .form-control {
-            background-color: #495057;
-            color: #ffffff; /* White form control text */
-            border-color: #5b6167;
-        }
-        [data-bs-theme="dark"] .form-control:focus {
-            background-color: #495057;
-            color: #ffffff; /* White form control text on focus */
-            border-color: #86b7fe; /* Bootstrap focus color */
-            box-shadow: 0 0 0 0.25rem rgba(13, 110, 253, 0.25);
-        }
-        [data-bs-theme="dark"] .form-label {
-            color: #adb5bd;
-        }
-        [data-bs-theme="dark"] .text-danger { /* Ensure custom text-danger is visible */
-            color: #ff8888 !important;
-        }
-        [data-bs-theme="dark"] .text-muted {
-             color: #adb5bd !important;
-        }
-        [data-bs-theme="dark"] span[style*="color: #000"] { /* For inline styled black text */
-            color: #ffffff !important; /* Change to white */
-        }
+        [data-bs-theme="dark"] body { background-color: #212529 !important; color: #ffffff !important; }
+        [data-bs-theme="dark"] h1, [data-bs-theme="dark"] h2, [data-bs-theme="dark"] h3, [data-bs-theme="dark"] h4, [data-bs-theme="dark"] h5, [data-bs-theme="dark"] h6 { color: #ffffff; }
+        [data-bs-theme="dark"] a:not(.btn):not(.nav-link):not(.dropdown-item):not(.navbar-brand) { color: #87cefa; }
+        [data-bs-theme="dark"] a:not(.btn):not(.nav-link):not(.dropdown-item):not(.navbar-brand):hover { color: #add8e6; }
+        [data-bs-theme="dark"] .navbar-dark { background-color: #343a40 !important; }
+        [data-bs-theme="dark"] .table { color: #ffffff; }
+        [data-bs-theme="dark"] .table-striped > tbody > tr:nth-of-type(odd) > * { var(--bs-table-accent-bg): rgba(255, 255, 255, 0.05); color: #ffffff; }
+        [data-bs-theme="dark"] .table-hover > tbody > tr:hover > * { var(--bs-table-accent-bg): rgba(255, 255, 255, 0.075); color: #ffffff; }
+        [data-bs-theme="dark"] .server-details-row td { background-color: #343a40; border-top: 1px solid #495057; }
+        [data-bs-theme="dark"] .detail-item { background-color: #495057; color: #ffffff; }
+        [data-bs-theme="dark"] .progress { background-color: #495057; }
+        [data-bs-theme="dark"] .progress span { color: #000000 !important; text-shadow: none; }
+        [data-bs-theme="dark"] .footer.bg-light { background-color: #343a40 !important; border-top: 1px solid #495057; }
+        [data-bs-theme="dark"] .footer .text-muted { color: #adb5bd !important; }
+        [data-bs-theme="dark"] .alert-info { background-color: #17a2b8; color: #fff; border-color: #17a2b8; }
+        [data-bs-theme="dark"] .btn-outline-light { color: #f8f9fa; border-color: #f8f9fa; }
+        [data-bs-theme="dark"] .btn-outline-light:hover { color: #212529; background-color: #f8f9fa; }
+        [data-bs-theme="dark"] .card { background-color: #343a40; border: 1px solid #495057; }
+        [data-bs-theme="dark"] .card-header { background-color: #495057; border-bottom: 1px solid #5b6167; }
+        [data-bs-theme="dark"] .modal-content { background-color: #343a40; color: #ffffff; }
+        [data-bs-theme="dark"] .modal-header { border-bottom-color: #495057; }
+        [data-bs-theme="dark"] .modal-footer { border-top-color: #495057; }
+        [data-bs-theme="dark"] .form-control { background-color: #495057; color: #ffffff; border-color: #5b6167; }
+        [data-bs-theme="dark"] .form-control:focus { background-color: #495057; color: #ffffff; border-color: #86b7fe; box-shadow: 0 0 0 0.25rem rgba(13, 110, 253, 0.25); }
+        [data-bs-theme="dark"] .form-label { color: #adb5bd; }
+        [data-bs-theme="dark"] .text-danger { color: #ff8888 !important; }
+        [data-bs-theme="dark"] .text-muted { color: #adb5bd !important; }
+        [data-bs-theme="dark"] span[style*="color: #000"] { color: #ffffff !important; }
     </style>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
         <div class="container">
-            <a class="navbar-brand" href="/">VPS监控面板</a>
+            <a class="navbar-brand" href="/">Uptime Status</a>
             <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
                 <span class="navbar-toggler-icon"></span>
             </button>
             <div class="collapse navbar-collapse" id="navbarNav">
                 <ul class="navbar-nav ms-auto align-items-center">
                     <li class="nav-item">
-                        <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="btn btn-outline-light btn-sm me-2" title="GitHub Repository">
-                            <i class="bi bi-github"></i>
-                        </a>
-                    </li>
-                    <li class="nav-item">
                         <button id="themeToggler" class="btn btn-outline-light btn-sm me-2" title="切换主题">
-                            <i class="bi bi-moon-stars-fill"></i>
+                             <i class="bi bi-moon-stars-fill"></i>
                         </button>
                     </li>
                     <li class="nav-item">
@@ -2154,6 +1875,7 @@ function getIndexHtml() {
                         <th>CPU</th>
                         <th>内存</th>
                         <th>硬盘</th>
+                        <th class="text-center">线路 (CU|CT|CM)</th>
                         <th>上传</th>
                         <th>下载</th>
                         <th>总上传</th>
@@ -2164,14 +1886,13 @@ function getIndexHtml() {
                 </thead>
                 <tbody id="serverTableBody">
                     <tr>
-                        <td colspan="11" class="text-center">加载中...</td>
+                        <td colspan="12" class="text-center">加载中...</td>
                     </tr>
                 </tbody>
             </table>
         </div>
     </div>
 
-    <!-- Website Status Section -->
     <div class="container mt-5">
         <h2>网站在线状态</h2>
         <div id="noSites" class="alert alert-info d-none">
@@ -2197,25 +1918,18 @@ function getIndexHtml() {
             </table>
         </div>
     </div>
-    <!-- End Website Status Section -->
-
-    <!-- Server Detailed row template (hidden by default) -->
     <template id="serverDetailsTemplate">
         <tr class="server-details-row d-none">
-            <td colspan="11">
+            <td colspan="12">
                 <div class="server-details-content">
-                    <!-- Detailed metrics will be populated here by JavaScript -->
-                </div>
+                    </div>
             </td>
         </tr>
     </template>
 
     <footer class="footer mt-5 py-3 bg-light">
         <div class="container text-center">
-            <span class="text-muted">VPS监控面板 &copy; 2025</span>
-            <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="ms-3 text-muted" title="GitHub Repository">
-                <i class="bi bi-github fs-5"></i>
-            </a>
+        <a href="https://rcrc.eu.org" target="_blank" rel="noopener noreferrer" class="ms-3 text-muted" title="Server Status">Server Status</a>
         </div>
     </footer>
 
@@ -2231,176 +1945,25 @@ function getLoginHtml() {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>登录 - VPS监控面板</title>
+    <title>Login - Uptime Status</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.8.1/font/bootstrap-icons.css" rel="stylesheet">
     <link href="/css/style.css" rel="stylesheet">
     <style>
-        .server-row {
-            cursor: pointer; /* Indicate clickable rows */
-        }
-        .server-details-row {
-            /* display: none; /* Initially hidden - controlled by JS */ */
-        }
-        .server-details-row td {
-            padding: 1rem;
-            background-color: #f8f9fa; /* Light background for details */
-        }
-        .server-details-content {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1rem;
-        }
-        .detail-item {
-            background-color: #e9ecef;
-            padding: 0.75rem;
-            border-radius: 0.25rem;
-        }
-        .detail-item strong {
-            display: block;
-            margin-bottom: 0.25rem;
-        }
-        .history-bar-container {
-            display: inline-flex; /* Changed to inline-flex for centering within td */
-            flex-direction: row-reverse; /* Newest on the right */
-            align-items: center;
-            justify-content: center; /* Center the bars within this container */
-            height: 25px; /* Increased height */
-            gap: 2px; /* Space between bars */
-        }
-        .history-bar {
-            width: 8px; /* Increased width of each bar */
-            height: 100%;
-            /* margin-left: 1px; /* Replaced by gap */
-            border-radius: 1px;
-        }
-        .history-bar-up { background-color: #28a745; } /* Green */
-        .history-bar-down { background-color: #dc3545; } /* Red */
-        .history-bar-pending { background-color: #6c757d; } /* Gray */
-
-        /* Default styling for progress bar text (light mode) */
-        .progress span {
-            color: #000000; /* Black text for progress bars by default */
-            /* font-weight: bold; is handled by inline style in JS */
-        }
-
-        /* Center the "24h记录" (site table) and "上传" (server table) headers and their data cells */
-        .table > thead > tr > th:nth-child(6), /* Targets 6th header in both tables */
-        #siteStatusTableBody tr > td:nth-child(6), /* Targets 6th data cell in site status table */
-        #serverTableBody tr > td:nth-child(6) { /* Targets 6th data cell in server status table */
-            text-align: center;
-        }
-
-        /* Dark Theme Adjustments */
-        [data-bs-theme="dark"] body {
-            background-color: #212529; /* Bootstrap dark bg */
-            color: #ffffff; /* White text for dark mode */
-        }
-        [data-bs-theme="dark"] h1, [data-bs-theme="dark"] h2, [data-bs-theme="dark"] h3, [data-bs-theme="dark"] h4, [data-bs-theme="dark"] h5, [data-bs-theme="dark"] h6 {
-            color: #ffffff; /* White color for headings */
-        }
-        [data-bs-theme="dark"] a:not(.btn):not(.nav-link):not(.dropdown-item):not(.navbar-brand) {
-            color: #87cefa; /* LightSkyBlue for general links, good contrast on dark */
-        }
-        [data-bs-theme="dark"] a:not(.btn):not(.nav-link):not(.dropdown-item):not(.navbar-brand):hover {
-            color: #add8e6; /* Lighter blue on hover */
-        }
-        [data-bs-theme="dark"] .navbar-dark {
-            background-color: #343a40 !important; /* Darker navbar */
-        }
-        [data-bs-theme="dark"] .table {
-            color: #ffffff; /* White table text */
-        }
-        [data-bs-theme="dark"] .table-striped > tbody > tr:nth-of-type(odd) > * {
-            --bs-table-accent-bg: rgba(255, 255, 255, 0.05); /* Darker stripe */
-            color: #ffffff; /* Ensure text in striped rows is white */
-        }
-        [data-bs-theme="dark"] .table-hover > tbody > tr:hover > * {
-            --bs-table-accent-bg: rgba(255, 255, 255, 0.075); /* Darker hover */
-            color: #ffffff; /* Ensure text in hovered rows is white */
-        }
-        [data-bs-theme="dark"] .server-details-row td {
-            background-color: #343a40; /* Darker details background */
-            border-top: 1px solid #495057;
-        }
-        [data-bs-theme="dark"] .detail-item {
-            background-color: #495057; /* Darker detail item background */
-            color: #ffffff; /* White text for detail items */
-        }
-        [data-bs-theme="dark"] .progress {
-            background-color: #495057; /* Darker progress bar background */
-        }
-        [data-bs-theme="dark"] .progress span { /* Text on progress bar */
-            color: #000000 !important; /* Black text for progress bars */
-            text-shadow: none; /* Remove shadow for black text or use a very light one if needed */
-        }
-        [data-bs-theme="dark"] .footer.bg-light {
-            background-color: #343a40 !important; /* Darker footer */
-            border-top: 1px solid #495057;
-        }
-        [data-bs-theme="dark"] .footer .text-muted {
-            color: #adb5bd !important; /* Lighter muted text */
-        }
-        [data-bs-theme="dark"] .alert-info {
-            background-color: #17a2b8; /* Bootstrap info color, adjust if needed */
-            color: #fff;
-            border-color: #17a2b8;
-        }
-        [data-bs-theme="dark"] .btn-outline-light {
-            color: #f8f9fa;
-            border-color: #f8f9fa;
-        }
-        [data-bs-theme="dark"] .btn-outline-light:hover {
-            color: #212529;
-            background-color: #f8f9fa;
-        }
-        [data-bs-theme="dark"] .card {
-            background-color: #343a40;
-            border: 1px solid #495057;
-        }
-        [data-bs-theme="dark"] .card-header {
-            background-color: #495057;
-            border-bottom: 1px solid #5b6167;
-        }
-        [data-bs-theme="dark"] .modal-content {
-            background-color: #343a40;
-            color: #ffffff; /* White modal text */
-        }
-        [data-bs-theme="dark"] .modal-header {
-            border-bottom-color: #495057;
-        }
-        [data-bs-theme="dark"] .modal-footer {
-            border-top-color: #495057;
-        }
-        [data-bs-theme="dark"] .form-control {
-            background-color: #495057;
-            color: #ffffff; /* White form control text */
-            border-color: #5b6167;
-        }
-        [data-bs-theme="dark"] .form-control:focus {
-            background-color: #495057;
-            color: #ffffff; /* White form control text on focus */
-            border-color: #86b7fe; /* Bootstrap focus color */
-            box-shadow: 0 0 0 0.25rem rgba(13, 110, 253, 0.25);
-        }
-        [data-bs-theme="dark"] .form-label {
-            color: #adb5bd;
-        }
-        [data-bs-theme="dark"] .text-danger { /* Ensure custom text-danger is visible */
-            color: #ff8888 !important;
-        }
-        [data-bs-theme="dark"] .text-muted {
-             color: #adb5bd !important;
-        }
-        [data-bs-theme="dark"] span[style*="color: #000"] { /* For inline styled black text */
-            color: #ffffff !important; /* Change to white */
-        }
+       /* Same styles as index */
+       /* Dark Theme Adjustments */
+        [data-bs-theme="dark"] body { background-color: #212529; color: #ffffff; }
+        [data-bs-theme="dark"] .card { background-color: #1e1e1e; border: 1px solid #333; color: #e0e0e0; }
+        [data-bs-theme="dark"] .card-header { background-color: #2a2a2a; border-bottom: 1px solid #333; color: #f5f5f5; }
+        [data-bs-theme="dark"] .form-control { background-color: #2a2a2a; color: #e0e0e0; border-color: #333; }
+        [data-bs-theme="dark"] .footer.bg-light { background-color: #343a40 !important; border-top: 1px solid #495057; }
+        [data-bs-theme="dark"] .footer .text-muted { color: #adb5bd !important; }
     </style>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
         <div class="container">
-            <a class="navbar-brand" href="/">VPS监控面板</a>
+            <a class="navbar-brand" href="/">Uptime Status</a>
             <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
                 <span class="navbar-toggler-icon"></span>
             </button>
@@ -2408,7 +1971,7 @@ function getLoginHtml() {
                 <ul class="navbar-nav ms-auto align-items-center">
                     <li class="nav-item">
                         <button id="themeToggler" class="btn btn-outline-light btn-sm me-2" title="切换主题">
-                            <i class="bi bi-moon-stars-fill"></i>
+                             <i class="bi bi-moon-stars-fill"></i>
                         </button>
                     </li>
                     <li class="nav-item">
@@ -2442,9 +2005,6 @@ function getLoginHtml() {
                             </div>
                         </form>
                     </div>
-                    <div class="card-footer text-muted">
-                        <small>初始账号密码: admin / admin</small>
-                    </div>
                 </div>
             </div>
         </div>
@@ -2452,10 +2012,7 @@ function getLoginHtml() {
 
     <footer class="footer mt-5 py-3 bg-light">
         <div class="container text-center">
-            <span class="text-muted">VPS监控面板 &copy; 2025</span>
-            <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="ms-3 text-muted" title="GitHub Repository">
-                <i class="bi bi-github fs-5"></i>
-            </a>
+            <span class="text-muted">&copy; Uptime Status</span>
         </div>
     </footer>
 
@@ -2471,7 +2028,7 @@ function getAdminHtml() {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>管理后台 - VPS监控面板</title>
+    <title>Manage - Uptime Status</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.8.1/font/bootstrap-icons.css" rel="stylesheet">
     <link href="/css/style.css" rel="stylesheet">
@@ -2479,22 +2036,17 @@ function getAdminHtml() {
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
         <div class="container">
-            <a class="navbar-brand" href="/">VPS监控面板</a>
+            <a class="navbar-brand" href="/">Uptime Status</a>
             <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
                 <span class="navbar-toggler-icon"></span>
             </button>
             <div class="collapse navbar-collapse" id="navbarNav">
                 <ul class="navbar-nav me-auto">
                     <li class="nav-item">
-                        <a class="nav-link" href="/">返回首页</a>
+                         <a class="nav-link" href="/">返回首页</a>
                     </li>
                 </ul>
                 <ul class="navbar-nav align-items-center">
-                    <li class="nav-item">
-                        <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="btn btn-outline-light btn-sm me-2" title="GitHub Repository">
-                            <i class="bi bi-github"></i>
-                        </a>
-                    </li>
                     <li class="nav-item">
                         <button id="themeToggler" class="btn btn-outline-light btn-sm me-2" title="切换主题">
                             <i class="bi bi-moon-stars-fill"></i>
@@ -2512,11 +2064,9 @@ function getAdminHtml() {
     </nav>
 
     <div class="container mt-4">
-        <div class="d-flex align-items-center mb-4"> <!-- Main flex container for the header row -->
-            <h2 class="mb-0 me-3">服务器管理</h2> <!-- Server Management Heading -->
-
-            <!-- VPS Data Update Frequency Form -->
-            <form id="globalSettingsFormPartial" class="row gx-2 gy-2 align-items-center me-auto"> <!-- me-auto pushes Add Server button to the right -->
+        <div class="d-flex align-items-center mb-4">
+            <h2 class="mb-0 me-3">服务器管理</h2>
+            <form id="globalSettingsFormPartial" class="row gx-2 gy-2 align-items-center me-auto">
                 <div class="col-auto">
                      <label for="vpsReportInterval" class="col-form-label col-form-label-sm">VPS数据更新频率 (秒):</label>
                 </div>
@@ -2528,12 +2078,10 @@ function getAdminHtml() {
                 </div>
             </form>
 
-            <!-- Add Server Button -->
             <button id="addServerBtn" class="btn btn-primary">
                 <i class="bi bi-plus-circle"></i> 添加服务器
             </button>
         </div>
-        <!-- Removed globalSettingsAlert as serverAlert will be used -->
         <div id="serverAlert" class="alert d-none"></div>
         <div class="card">
             <div class="card-body">
@@ -2549,7 +2097,6 @@ function getAdminHtml() {
                                 <th>最后更新</th>
                                 <th>API密钥</th>
                                 <th>VPS脚本</th>
-                                <!-- Removed <th>频繁通知 (10分钟)</th> -->
                                 <th>操作</th>
                             </tr>
                         </thead>
@@ -2564,7 +2111,6 @@ function getAdminHtml() {
         </div>
     </div>
 
-    <!-- Website Monitoring Section -->
     <div class="container mt-5">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <h2>网站监控管理</h2>
@@ -2588,7 +2134,6 @@ function getAdminHtml() {
                                 <th>状态码</th>
                                 <th>响应时间 (ms)</th>
                                 <th>最后检查</th>
-                                <!-- Removed <th>频繁通知 (10分钟)</th> -->
                                 <th>操作</th>
                             </tr>
                         </thead>
@@ -2602,9 +2147,6 @@ function getAdminHtml() {
             </div>
         </div>
     </div>
-    <!-- End Website Monitoring Section -->
-
-    <!-- Telegram Notification Settings Section -->
     <div class="container mt-5">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <h2>Telegram 通知设置</h2>
@@ -2632,14 +2174,6 @@ function getAdminHtml() {
             </div>
         </div>
     </div>
-    <!-- End Telegram Notification Settings Section -->
-
-    <!-- Global Settings Section (Now integrated above Server Management List) -->
-    <!-- The form is now part of the header for Server Management -->
-    <!-- End Global Settings Section -->
-
-
-    <!-- 服务器模态框 -->
     <div class="modal fade" id="serverModal" tabindex="-1">
         <div class="modal-dialog">
             <div class="modal-content">
@@ -2658,7 +2192,6 @@ function getAdminHtml() {
                             <label for="serverDescription" class="form-label">描述（可选）</label>
                             <textarea class="form-control" id="serverDescription" rows="2"></textarea>
                         </div>
-                        <!-- Removed serverEnableFrequentNotifications checkbox -->
 
                         <div id="serverIdDisplayGroup" class="mb-3 d-none">
                             <label for="serverIdDisplay" class="form-label">服务器ID</label>
@@ -2699,7 +2232,6 @@ function getAdminHtml() {
         </div>
     </div>
 
-    <!-- 网站监控模态框 -->
     <div class="modal fade" id="siteModal" tabindex="-1">
         <div class="modal-dialog">
             <div class="modal-content">
@@ -2718,7 +2250,6 @@ function getAdminHtml() {
                             <label for="siteUrl" class="form-label">网站URL</label>
                             <input type="url" class="form-control" id="siteUrl" placeholder="https://example.com" required>
                         </div>
-                        <!-- Removed siteEnableFrequentNotifications checkbox -->
                     </form>
                 </div>
                 <div class="modal-footer">
@@ -2729,7 +2260,6 @@ function getAdminHtml() {
         </div>
     </div>
 
-    <!-- 服务器删除确认模态框 -->
     <div class="modal fade" id="deleteModal" tabindex="-1">
         <div class="modal-dialog">
             <div class="modal-content">
@@ -2749,8 +2279,7 @@ function getAdminHtml() {
         </div>
     </div>
 
-     <!-- 网站删除确认模态框 -->
-    <div class="modal fade" id="deleteSiteModal" tabindex="-1">
+     <div class="modal fade" id="deleteSiteModal" tabindex="-1">
         <div class="modal-dialog">
             <div class="modal-content">
                 <div class="modal-header">
@@ -2769,7 +2298,6 @@ function getAdminHtml() {
         </div>
     </div>
 
-    <!-- 修改密码模态框 -->
     <div class="modal fade" id="passwordModal" tabindex="-1">
         <div class="modal-dialog">
             <div class="modal-content">
@@ -2804,10 +2332,7 @@ function getAdminHtml() {
 
     <footer class="footer mt-5 py-3 bg-light">
         <div class="container text-center">
-            <span class="text-muted">VPS监控面板 &copy; 2025</span>
-            <a href="https://github.com/kadidalax/cf-vps-monitor" target="_blank" rel="noopener noreferrer" class="ms-3 text-muted" title="GitHub Repository">
-                <i class="bi bi-github fs-5"></i>
-            </a>
+            <span class="text-muted">&copy; Uptime Status</span>
         </div>
     </footer>
 
@@ -2819,233 +2344,49 @@ function getAdminHtml() {
 
 function getStyleCss() {
   return `/* 全局样式 */
-body {
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
+body { min-height: 100vh; display: flex; flex-direction: column; }
+.footer { margin-top: auto; }
+.chart-container { position: relative; height: 200px; width: 100%; }
+.card { box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075); margin-bottom: 1.5rem; }
+.card-header { background-color: rgba(0, 0, 0, 0.03); border-bottom: 1px solid rgba(0, 0, 0, 0.125); }
+.progress { height: 0.75rem; }
+.table th { font-weight: 600; }
+.modal-dialog { display: flex; align-items: center; min-height: calc(100% - 1rem); }
+.modal-content { background-color: rgba(255, 255, 255, 0.9); }
+@media (max-width: 768px) { .chart-container { height: 150px; } }
+.bg-light-green { background-color: #90ee90 !important; }
+#serverAlert, #siteAlert, #telegramSettingsAlert { position: fixed !important; top: 70px; left: 50%; transform: translateX(-50%); z-index: 1055; padding: 0.75rem 1.25rem; border: 1px solid transparent; border-radius: 0.25rem; min-width: 300px; max-width: 90%; text-align: center; box-shadow: 0 0.5rem 1rem rgba(0,0,0,0.15); }
+#serverAlert.d-none, #siteAlert.d-none, #telegramSettingsAlert.d-none { display: none !important; }
+#serverAlert.alert-success, #siteAlert.alert-success, #telegramSettingsAlert.alert-success { color: #0f5132; background-color: rgba(209, 231, 221, 0.95) !important; border-color: rgba(190, 221, 208, 0.95) !important; }
+#serverAlert.alert-danger, #siteAlert.alert-danger, #telegramSettingsAlert.alert-danger { color: #842029; background-color: rgba(248, 215, 218, 0.95) !important; border-color: rgba(245, 198, 203, 0.95) !important; }
+#serverAlert.alert-warning, #siteAlert.alert-warning, #telegramSettingsAlert.alert-warning { color: #664d03; background-color: rgba(255, 243, 205, 0.95) !important; border-color: rgba(255, 238, 186, 0.95) !important; }
+
+[data-bs-theme="dark"] {
+    body { background-color: #121212; color: #e0e0e0; }
+    .card { background-color: #1e1e1e; border: 1px solid #333; color: #e0e0e0; }
+    .card-header { background-color: #2a2a2a; border-bottom: 1px solid #333; color: #f5f5f5; }
+    .table { color: #e0e0e0; }
+    .table th, .table td { border-color: #333; }
+    .table-striped > tbody > tr:nth-of-type(odd) > * { background-color: rgba(255, 255, 255, 0.05); color: #e0e0e0; }
+    .table-hover > tbody > tr:hover > * { background-color: rgba(255, 255, 255, 0.075); color: #f0f0f0; }
+    .modal-content { background-color: rgba(30, 30, 30, 0.9); color: #e0e0e0; }
+    .modal-header { border-bottom-color: #333; }
+    .modal-footer { border-top-color: #333; }
+    .form-control { background-color: #2a2a2a; color: #e0e0e0; border-color: #333; }
+    .form-control:focus { background-color: #2a2a2a; color: #e0e0e0; border-color: #555; box-shadow: 0 0 0 0.25rem rgba(100, 100, 100, 0.25); }
+    .btn-outline-secondary { color: #adb5bd; border-color: #6c757d; }
+    .btn-outline-secondary:hover { color: #fff; background-color: #6c757d; border-color: #6c757d; }
+    .navbar { background-color: #1e1e1e !important; }
+    .navbar-light .navbar-nav .nav-link { color: #ccc; }
+    .navbar-light .navbar-nav .nav-link:hover { color: #fff; }
+    .navbar-light .navbar-brand { color: #fff; }
+    .footer { background-color: #1e1e1e !important; color: #cccccc; }
+    a { color: #8ab4f8; }
+    a:hover { color: #a9c9fc; }
+    [data-bs-theme="dark"] #serverAlert.alert-success, [data-bs-theme="dark"] #siteAlert.alert-success, [data-bs-theme="dark"] #telegramSettingsAlert.alert-success { color: #75b798; background-color: rgba(40, 167, 69, 0.85) !important; border-color: rgba(34, 139, 57, 0.85) !important; }
+    [data-bs-theme="dark"] #serverAlert.alert-danger, [data-bs-theme="dark"] #siteAlert.alert-danger, [data-bs-theme="dark"] #telegramSettingsAlert.alert-danger { color: #ea868f; background-color: rgba(220, 53, 69, 0.85) !important; border-color: rgba(187, 45, 59, 0.85) !important; }
+    [data-bs-theme="dark"] #serverAlert.alert-warning, [data-bs-theme="dark"] #siteAlert.alert-warning, [data-bs-theme="dark"] #telegramSettingsAlert.alert-warning { color: #ffd373; background-color: rgba(255, 193, 7, 0.85) !important; border-color: rgba(217, 164, 6, 0.85) !important; }
 }
-
-.footer {
-    margin-top: auto;
-}
-
-/* 图表容器 */
-.chart-container {
-    position: relative;
-    height: 200px;
-    width: 100%;
-}
-
-/* 卡片样式 */
-.card {
-    box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
-    margin-bottom: 1.5rem;
-}
-
-.card-header {
-    background-color: rgba(0, 0, 0, 0.03);
-    border-bottom: 1px solid rgba(0, 0, 0, 0.125);
-}
-
-/* 进度条样式 */
-.progress {
-    height: 0.75rem;
-}
-
-/* 表格样式 */
-.table th {
-    font-weight: 600;
-}
-
-/* Modal centering and light theme transparency */
-.modal-dialog {
-    display: flex;
-    align-items: center;
-    min-height: calc(100% - 1rem); /* Adjust as needed */
-}
-
-.modal-content {
-    background-color: rgba(255, 255, 255, 0.9); /* Semi-transparent white for light theme */
-    /* backdrop-filter: blur(5px); /* Optional: adds a blur effect to content behind modal */
-}
-
-
-/* 响应式调整 */
-@media (max-width: 768px) {
-    .chart-container {
-        height: 150px;
-    }
-}
-
-/* 自定义浅绿色进度条 */
-.bg-light-green {
-    background-color: #90ee90 !important; /* LightGreen */
-}
-
-/* Custom styles for non-disruptive alerts in admin page */
-#serverAlert, #siteAlert, #telegramSettingsAlert {
-    position: fixed !important; /* Use !important to override Bootstrap if necessary */
-    top: 70px; /* Below navbar */
-    left: 50%;
-    transform: translateX(-50%);
-    z-index: 1055; /* Higher than Bootstrap modals (1050) */
-    padding: 0.75rem 1.25rem;
-    /* margin-bottom: 1rem; /* Not needed for fixed */
-    border: 1px solid transparent;
-    border-radius: 0.25rem;
-    min-width: 300px; /* Minimum width */
-    max-width: 90%; /* Max width */
-    text-align: center;
-    box-shadow: 0 0.5rem 1rem rgba(0,0,0,0.15);
-    /* Ensure d-none works to hide them, !important might be needed if Bootstrap's .alert.d-none is too specific */
-}
-
-#serverAlert.d-none, #siteAlert.d-none, #telegramSettingsAlert.d-none {
-    display: none !important;
-}
-
-/* Semi-transparent backgrounds for different alert types */
-/* Light Theme Overrides for fixed alerts */
-#serverAlert.alert-success, #siteAlert.alert-success, #telegramSettingsAlert.alert-success {
-    color: #0f5132; /* Bootstrap success text color */
-    background-color: rgba(209, 231, 221, 0.95) !important; /* Semi-transparent success, !important for specificity */
-    border-color: rgba(190, 221, 208, 0.95) !important;
-}
-
-#serverAlert.alert-danger, #siteAlert.alert-danger, #telegramSettingsAlert.alert-danger {
-    color: #842029; /* Bootstrap danger text color */
-    background-color: rgba(248, 215, 218, 0.95) !important; /* Semi-transparent danger */
-    border-color: rgba(245, 198, 203, 0.95) !important;
-}
-
-#serverAlert.alert-warning, #siteAlert.alert-warning, #telegramSettingsAlert.alert-warning { /* For siteAlert if it uses warning */
-    color: #664d03; /* Bootstrap warning text color */
-    background-color: rgba(255, 243, 205, 0.95) !important; /* Semi-transparent warning */
-    border-color: rgba(255, 238, 186, 0.95) !important;
-}
-
-
-    [data-bs-theme="dark"] {
-        body {
-            background-color: #121212; /* 深色背景 */
-            color: #e0e0e0; /* 浅色文字 */
-        }
-
-        .card {
-            background-color: #1e1e1e; /* 卡片深色背景 */
-            border: 1px solid #333;
-            color: #e0e0e0; /* 卡片内文字颜色 */
-        }
-
-        .card-header {
-            background-color: #2a2a2a;
-            border-bottom: 1px solid #333;
-            color: #f5f5f5;
-        }
-
-        .table {
-            color: #e0e0e0; /* 表格文字颜色 */
-        }
-
-        .table th, .table td {
-            border-color: #333; /* 表格边框颜色 */
-        }
-
-        .table-striped > tbody > tr:nth-of-type(odd) > * {
-             background-color: rgba(255, 255, 255, 0.05); /* 深色模式下的条纹 */
-             color: #e0e0e0;
-        }
-        
-        .table-hover > tbody > tr:hover > * {
-            background-color: rgba(255, 255, 255, 0.075); /* 深色模式下的悬停 */
-            color: #f0f0f0;
-        }
-
-        .modal-content {
-            background-color: rgba(30, 30, 30, 0.9); /* Semi-transparent dark grey for dark theme */
-            color: #e0e0e0;
-            /* backdrop-filter: blur(5px); /* Optional: adds a blur effect to content behind modal */
-        }
-
-        .modal-header {
-            border-bottom-color: #333;
-        }
-        
-        .modal-footer {
-            border-top-color: #333;
-        }
-
-        .form-control {
-            background-color: #2a2a2a;
-            color: #e0e0e0;
-            border-color: #333;
-        }
-
-        .form-control:focus {
-            background-color: #2a2a2a;
-            color: #e0e0e0;
-            border-color: #555;
-            box-shadow: 0 0 0 0.25rem rgba(100, 100, 100, 0.25);
-        }
-        
-        .btn-outline-secondary {
-             color: #adb5bd;
-             border-color: #6c757d;
-        }
-        .btn-outline-secondary:hover {
-             color: #fff;
-             background-color: #6c757d;
-             border-color: #6c757d;
-        }
-
-        .navbar {
-            background-color: #1e1e1e !important; /* 确保覆盖 Bootstrap 默认 */
-        }
-        .navbar-light .navbar-nav .nav-link {
-             color: #ccc;
-        }
-        .navbar-light .navbar-nav .nav-link:hover {
-             color: #fff;
-        }
-        .navbar-light .navbar-brand {
-             color: #fff;
-        }
-         .footer {
-            background-color: #1e1e1e !important;
-            color: #cccccc; /* 修复夜间模式页脚文本颜色 */
-        }
-        a {
-            color: #8ab4f8; /* 示例链接颜色 */
-        }
-        a:hover {
-            color: #a9c9fc;
-        }
-
-        /* Dark Theme Overrides for fixed alerts */
-        [data-bs-theme="dark"] #serverAlert.alert-success,
-        [data-bs-theme="dark"] #siteAlert.alert-success,
-        [data-bs-theme="dark"] #telegramSettingsAlert.alert-success {
-            color: #75b798; /* Lighter green text for dark theme */
-            background-color: rgba(40, 167, 69, 0.85) !important; /* Darker semi-transparent success */
-            border-color: rgba(34, 139, 57, 0.85) !important;
-        }
-
-        [data-bs-theme="dark"] #serverAlert.alert-danger,
-        [data-bs-theme="dark"] #siteAlert.alert-danger,
-        [data-bs-theme="dark"] #telegramSettingsAlert.alert-danger {
-            color: #ea868f; /* Lighter red text for dark theme */
-            background-color: rgba(220, 53, 69, 0.85) !important; /* Darker semi-transparent danger */
-            border-color: rgba(187, 45, 59, 0.85) !important;
-        }
-        
-        [data-bs-theme="dark"] #serverAlert.alert-warning,
-        [data-bs-theme="dark"] #siteAlert.alert-warning,
-        [data-bs-theme="dark"] #telegramSettingsAlert.alert-warning {
-            color: #ffd373; /* Lighter yellow text for dark theme */
-            background-color: rgba(255, 193, 7, 0.85) !important; /* Darker semi-transparent warning */
-            border-color: rgba(217, 164, 6, 0.85) !important;
-        }
-    }
 `;
 }
 
@@ -3055,19 +2396,19 @@ function getMainJs() {
 // Global variables
 let vpsUpdateInterval = null;
 let siteUpdateInterval = null;
-let serverDataCache = {}; // Cache server data to avoid re-fetching for details
-const DEFAULT_VPS_REFRESH_INTERVAL_MS = 60000; // Default to 60 seconds for VPS data if backend setting fails
-const DEFAULT_SITE_REFRESH_INTERVAL_MS = 60000; // Default to 60 seconds for Site data
+let serverDataCache = {};
+const DEFAULT_VPS_REFRESH_INTERVAL_MS = 60000;
+const DEFAULT_SITE_REFRESH_INTERVAL_MS = 60000;
 
 // Function to fetch VPS refresh interval and start periodic VPS data updates
 async function initializeVpsDataUpdates() {
     let vpsRefreshIntervalMs = DEFAULT_VPS_REFRESH_INTERVAL_MS;
     try {
-        const response = await fetch('/api/admin/settings/vps-report-interval'); // This API is public for GET
+        const response = await fetch('/api/admin/settings/vps-report-interval');
         if (response.ok) {
             const data = await response.json();
             if (data && typeof data.interval === 'number' && data.interval > 0) {
-                vpsRefreshIntervalMs = data.interval * 1000; // Convert seconds to milliseconds
+                vpsRefreshIntervalMs = data.interval * 1000;
                 console.log(\`Using backend-defined VPS refresh interval: \${data.interval}s\`);
             } else {
                 console.warn('Invalid VPS interval from backend, using default.');
@@ -3079,53 +2420,35 @@ async function initializeVpsDataUpdates() {
         console.error('Error fetching VPS refresh interval, using default:', error);
     }
 
-    // Clear existing interval if any
     if (vpsUpdateInterval) {
         clearInterval(vpsUpdateInterval);
     }
 
-    // Set up new periodic updates for VPS data ONLY
     vpsUpdateInterval = setInterval(() => {
         loadAllServerStatuses();
     }, vpsRefreshIntervalMs);
-
     console.log(\`VPS data will refresh every \${vpsRefreshIntervalMs / 1000} seconds.\`);
 }
 
 // Function to start periodic site status updates
 function initializeSiteDataUpdates() {
-    const siteRefreshIntervalMs = DEFAULT_SITE_REFRESH_INTERVAL_MS; // Using a fixed interval for sites
-
-    // Clear existing interval if any
+    const siteRefreshIntervalMs = DEFAULT_SITE_REFRESH_INTERVAL_MS;
     if (siteUpdateInterval) {
         clearInterval(siteUpdateInterval);
     }
-
-    // Set up new periodic updates for site statuses ONLY
     siteUpdateInterval = setInterval(() => {
         loadAllSiteStatuses();
     }, siteRefreshIntervalMs);
-
     console.log(\`Site status data will refresh every \${siteRefreshIntervalMs / 1000} seconds.\`);
 }
 
-// Execute after the page loads
 document.addEventListener('DOMContentLoaded', function() {
-    // Initialize theme
     initializeTheme();
-
-    // Load initial data
     loadAllServerStatuses();
     loadAllSiteStatuses();
-
-    // Initialize periodic updates separately
     initializeVpsDataUpdates();
     initializeSiteDataUpdates();
-
-    // Add click event listener to the table body for row expansion
     document.getElementById('serverTableBody').addEventListener('click', handleRowClick);
-
-    // Check login status and update admin link
     updateAdminLink();
 });
 
@@ -3133,14 +2456,11 @@ document.addEventListener('DOMContentLoaded', function() {
 const THEME_KEY = 'themePreference';
 const LIGHT_THEME = 'light';
 const DARK_THEME = 'dark';
-
 function initializeTheme() {
     const themeToggler = document.getElementById('themeToggler');
     if (!themeToggler) return;
-
     const storedTheme = localStorage.getItem(THEME_KEY) || LIGHT_THEME;
     applyTheme(storedTheme);
-
     themeToggler.addEventListener('click', () => {
         const currentTheme = document.documentElement.getAttribute('data-bs-theme');
         const newTheme = currentTheme === DARK_THEME ? LIGHT_THEME : DARK_THEME;
@@ -3148,7 +2468,6 @@ function initializeTheme() {
         localStorage.setItem(THEME_KEY, newTheme);
     });
 }
-
 function applyTheme(theme) {
     document.documentElement.setAttribute('data-bs-theme', theme);
     const themeTogglerIcon = document.querySelector('#themeToggler i');
@@ -3164,86 +2483,62 @@ function applyTheme(theme) {
 }
 // --- End Theme Management ---
 
-// Check login status and update the admin link in the navbar
 async function updateAdminLink() {
     const adminLink = document.getElementById('adminAuthLink');
-    if (!adminLink) return; // Exit if link not found
-
+    if (!adminLink) return;
     try {
         const token = localStorage.getItem('auth_token');
         if (!token) {
-            // Not logged in (no token)
             adminLink.textContent = '管理员登录';
             adminLink.href = '/login.html';
             return;
         }
-
         const response = await fetch('/api/auth/status', {
-            headers: {
-                'Authorization': \`Bearer \${token}\`
-            }
+            headers: { 'Authorization': \`Bearer \${token}\` }
         });
-
         if (response.ok) {
             const data = await response.json();
             if (data.authenticated) {
-                // Logged in
                 adminLink.textContent = '管理后台';
                 adminLink.href = '/admin.html';
             } else {
-                // Invalid token or not authenticated
                 adminLink.textContent = '管理员登录';
                 adminLink.href = '/login.html';
-                localStorage.removeItem('auth_token'); // Clean up invalid token
+                localStorage.removeItem('auth_token');
             }
         } else {
-            // API error, assume not logged in
             adminLink.textContent = '管理员登录';
             adminLink.href = '/login.html';
         }
     } catch (error) {
         console.error('Error checking auth status for navbar link:', error);
-        // Network error, assume not logged in
         adminLink.textContent = '管理员登录';
         adminLink.href = '/login.html';
     }
 }
 
-
-// Handle click on a server row
 function handleRowClick(event) {
     const clickedRow = event.target.closest('tr.server-row');
-    if (!clickedRow) return; // Not a server row
-
+    if (!clickedRow) return;
     const serverId = clickedRow.getAttribute('data-server-id');
-    const detailsRow = clickedRow.nextElementSibling; // The details row is the next sibling
-
+    const detailsRow = clickedRow.nextElementSibling;
     if (detailsRow && detailsRow.classList.contains('server-details-row')) {
-        // Toggle visibility
         detailsRow.classList.toggle('d-none');
-
-        // If showing, populate with detailed data
         if (!detailsRow.classList.contains('d-none')) {
             populateDetailsRow(serverId, detailsRow);
         }
     }
 }
 
-// Populate the detailed row with data
 function populateDetailsRow(serverId, detailsRow) {
     const serverData = serverDataCache[serverId];
     const detailsContentDiv = detailsRow.querySelector('.server-details-content');
-
     if (!serverData || !serverData.metrics || !detailsContentDiv) {
         detailsContentDiv.innerHTML = '<p class="text-muted">无详细数据</p>';
         return;
     }
-
     const metrics = serverData.metrics;
-
     let detailsHtml = '';
-
-    // CPU Details
     if (metrics.cpu && metrics.cpu.load_avg) {
         detailsHtml += \`
             <div class="detail-item">
@@ -3251,8 +2546,6 @@ function populateDetailsRow(serverId, detailsRow) {
             </div>
         \`;
     }
-
-    // Memory Details
     if (metrics.memory) {
         detailsHtml += \`
             <div class="detail-item">
@@ -3263,8 +2556,6 @@ function populateDetailsRow(serverId, detailsRow) {
             </div>
         \`;
     }
-
-    // Disk Details
     if (metrics.disk) {
          detailsHtml += \`
             <div class="detail-item">
@@ -3275,8 +2566,6 @@ function populateDetailsRow(serverId, detailsRow) {
             </div>
         \`;
     }
-
-    // Network Totals
     if (metrics.network) {
         detailsHtml += \`
             <div class="detail-item">
@@ -3286,36 +2575,30 @@ function populateDetailsRow(serverId, detailsRow) {
             </div>
         \`;
     }
-
     detailsContentDiv.innerHTML = detailsHtml || '<p class="text-muted">无详细数据</p>';
 }
 
 
-// Load all server statuses
 async function loadAllServerStatuses() {
     try {
-        // 1. Get server list
         const serversResponse = await fetch('/api/servers');
         if (!serversResponse.ok) {
             throw new Error('Failed to get server list');
         }
         const serversData = await serversResponse.json();
         const servers = serversData.servers || [];
-
         const noServersAlert = document.getElementById('noServers');
         const serverTableBody = document.getElementById('serverTableBody');
 
         if (servers.length === 0) {
             noServersAlert.classList.remove('d-none');
-            serverTableBody.innerHTML = '<tr><td colspan="11" class="text-center">No server data available. Please log in to the admin panel to add servers.</td></tr>';
-            // Remove any existing detail rows if the server list becomes empty
+            serverTableBody.innerHTML = '<tr><td colspan="12" class="text-center">No server data available. Please log in to the admin panel to add servers.</td></tr>';
             removeAllDetailRows();
             return;
         } else {
             noServersAlert.classList.add('d-none');
         }
 
-        // 2. Fetch status for all servers in parallel
         const statusPromises = servers.map(server =>
             fetch(\`/api/status/\${server.id}\`)
                 .then(res => res.ok ? res.json() : Promise.resolve({ server: server, metrics: null, error: true }))
@@ -3323,46 +2606,37 @@ async function loadAllServerStatuses() {
         );
 
         const allStatuses = await Promise.all(statusPromises);
-
-        // Update the serverDataCache with the latest data
         allStatuses.forEach(data => {
              serverDataCache[data.server.id] = data;
         });
-
-
-        // 3. Render the table using DOM manipulation
         renderServerTable(allStatuses);
-
     } catch (error) {
         console.error('Error loading server statuses:', error);
         const serverTableBody = document.getElementById('serverTableBody');
-        serverTableBody.innerHTML = '<tr><td colspan="11" class="text-center text-danger">Failed to load server data. Please refresh the page.</td></tr>';
+        serverTableBody.innerHTML = '<tr><td colspan="12" class="text-center text-danger">Failed to load server data. Please refresh the page.</td></tr>';
          removeAllDetailRows();
     }
 }
 
-// Remove all existing server detail rows
 function removeAllDetailRows() {
     document.querySelectorAll('.server-details-row').forEach(row => row.remove());
 }
 
 
-// Generate progress bar HTML
 function getProgressBarHtml(percentage) {
     if (typeof percentage !== 'number' || isNaN(percentage)) return '-';
-    const percent = Math.max(0, Math.min(100, percentage)); // Ensure percentage is between 0 and 100
-    let bgColorClass = 'bg-light-green'; // Use custom light green for < 50%
-
+    const percent = Math.max(0, Math.min(100, percentage));
+    let bgColorClass = 'bg-light-green';
     if (percent >= 80) {
-        bgColorClass = 'bg-danger'; // Red for >= 80%
+        bgColorClass = 'bg-danger';
     } else if (percent >= 50) {
-        bgColorClass = 'bg-warning'; // Yellow for 50% - 79%
+        bgColorClass = 'bg-warning';
     }
 
-    // Use relative positioning on the container and absolute for the text, centered over the whole bar
     return \`
         <div class="progress" style="height: 25px; font-size: 0.8em; position: relative; background-color: #e9ecef;">
-            <div class="progress-bar \${bgColorClass}" role="progressbar" style="width: \${percent}%;" aria-valuenow="\${percent}" aria-valuemin="0" aria-valuemax="100"></div>
+            <div class="progress-bar \${bgColorClass}" role="progressbar" style="width: \${percent}%;"
+                aria-valuenow="\${percent}" aria-valuemin="0" aria-valuemax="100"></div>
             <span style="position: absolute; width: 100%; text-align: center; line-height: 25px; font-weight: bold;">
                 \${percent.toFixed(1)}%
             </span>
@@ -3371,14 +2645,11 @@ function getProgressBarHtml(percentage) {
 }
 
 
-// Render the server table using DOM manipulation
 function renderServerTable(allStatuses) {
     const tableBody = document.getElementById('serverTableBody');
     const detailsTemplate = document.getElementById('serverDetailsTemplate');
 
-    // 1. Store IDs of currently expanded servers
     const expandedServerIds = new Set();
-    // Iterate over main server rows to find their expanded detail rows
     tableBody.querySelectorAll('tr.server-row').forEach(mainRow => {
         const detailRow = mainRow.nextElementSibling;
         if (detailRow && detailRow.classList.contains('server-details-row') && !detailRow.classList.contains('d-none')) {
@@ -3389,7 +2660,7 @@ function renderServerTable(allStatuses) {
         }
     });
 
-    tableBody.innerHTML = ''; // Clear existing rows
+    tableBody.innerHTML = '';
 
     allStatuses.forEach(data => {
         const serverId = data.server.id;
@@ -3407,6 +2678,7 @@ function renderServerTable(allStatuses) {
         let totalDownload = '-';
         let uptime = '-';
         let lastUpdate = '-';
+        let pingHtml = '-'; // 新增
 
         if (hasError) {
             statusBadge = '<span class="badge bg-warning text-dark">错误</span>';
@@ -3415,7 +2687,7 @@ function renderServerTable(allStatuses) {
             const lastReportTime = new Date(metrics.timestamp * 1000);
             const diffMinutes = (now - lastReportTime) / (1000 * 60);
 
-            if (diffMinutes <= 5) { // Considered online within 5 minutes
+            if (diffMinutes <= 5) {
                 statusBadge = '<span class="badge bg-success">在线</span>';
             } else {
                 statusBadge = '<span class="badge bg-danger">离线</span>';
@@ -3430,9 +2702,27 @@ function renderServerTable(allStatuses) {
             totalDownload = formatDataSize(metrics.network.total_download);
             uptime = metrics.uptime ? formatUptime(metrics.uptime) : '-';
             lastUpdate = lastReportTime.toLocaleString();
+
+            // 渲染丢包率
+             if (metrics.ping) {
+                const getLossClass = (loss) => {
+                    if (loss === undefined || loss === null) return 'text-muted';
+                    if (loss == 0) return 'text-success';
+                    if (loss < 10) return 'text-warning';
+                    return 'text-danger';
+                };
+                const cu = metrics.ping.cu !== undefined ? metrics.ping.cu + '%' : '-';
+                const ct = metrics.ping.ct !== undefined ? metrics.ping.ct + '%' : '-';
+                const cm = metrics.ping.cm !== undefined ? metrics.ping.cm + '%' : '-';
+                
+                pingHtml = \`
+                    <span class="\${getLossClass(metrics.ping.cu)}" title="联通">\${cu}</span> | 
+                    <span class="\${getLossClass(metrics.ping.ct)}" title="电信">\${ct}</span> | 
+                    <span class="\${getLossClass(metrics.ping.cm)}" title="移动">\${cm}</span>
+                \`;
+            }
         }
 
-        // Create the main row
         const mainRow = document.createElement('tr');
         mainRow.classList.add('server-row');
         mainRow.setAttribute('data-server-id', serverId);
@@ -3442,6 +2732,7 @@ function renderServerTable(allStatuses) {
             <td>\${cpuHtml}</td>
             <td>\${memoryHtml}</td>
             <td>\${diskHtml}</td>
+            <td class="text-center">\${pingHtml}</td>
             <td><span style="color: #000;">\${uploadSpeed}</span></td>
             <td><span style="color: #000;">\${downloadSpeed}</span></td>
             <td><span style="color: #000;">\${totalUpload}</span></td>
@@ -3449,26 +2740,19 @@ function renderServerTable(allStatuses) {
             <td><span style="color: #000;">\${uptime}</span></td>
             <td><span style="color: #000;">\${lastUpdate}</span></td>
         \`;
-
-        // Clone the details row template
+        
         const detailsRowElement = detailsTemplate.content.cloneNode(true).querySelector('tr');
-        // The template has d-none by default. We will remove it if needed.
-        // Set a unique attribute for easier selection if needed, though direct reference is used here.
-        // detailsRowElement.setAttribute('data-detail-for', serverId); 
-
         tableBody.appendChild(mainRow);
         tableBody.appendChild(detailsRowElement);
 
-        // 2. If this server was previously expanded, re-expand it and populate its details
         if (expandedServerIds.has(serverId)) {
             detailsRowElement.classList.remove('d-none');
-            populateDetailsRow(serverId, detailsRowElement); // Populate content
+            populateDetailsRow(serverId, detailsRowElement);
         }
     });
 }
 
 
-// Format network speed
 function formatNetworkSpeed(bytesPerSecond) {
     if (typeof bytesPerSecond !== 'number' || isNaN(bytesPerSecond)) return '-';
     if (bytesPerSecond < 1024) {
@@ -3482,7 +2766,6 @@ function formatNetworkSpeed(bytesPerSecond) {
     }
 }
 
-// Format data size
 function formatDataSize(bytes) {
     if (typeof bytes !== 'number' || isNaN(bytes)) return '-';
     if (bytes < 1024) {
@@ -3498,12 +2781,10 @@ function formatDataSize(bytes) {
     }
 }
 
-// Format uptime from seconds to a human-readable string
 function formatUptime(totalSeconds) {
     if (typeof totalSeconds !== 'number' || isNaN(totalSeconds) || totalSeconds < 0) {
         return '-';
     }
-
     const days = Math.floor(totalSeconds / (3600 * 24));
     totalSeconds %= (3600 * 24);
     const hours = Math.floor(totalSeconds / 3600);
@@ -3517,17 +2798,15 @@ function formatUptime(totalSeconds) {
     if (hours > 0) {
         uptimeString += \`\${hours}小时 \`;
     }
-    if (minutes > 0 || (days === 0 && hours === 0)) { // Show minutes if it's the only unit or if other units are zero
+    if (minutes > 0 || (days === 0 && hours === 0)) {
         uptimeString += \`\${minutes}分钟\`;
     }
-    
-    return uptimeString.trim() || '0分钟'; // Default to 0 minutes if string is empty
+    return uptimeString.trim() || '0分钟';
 }
 
 
 // --- Website Status Functions ---
 
-// Load all website statuses
 async function loadAllSiteStatuses() {
     try {
         const response = await fetch('/api/sites/status');
@@ -3536,31 +2815,27 @@ async function loadAllSiteStatuses() {
         }
         const data = await response.json();
         const sites = data.sites || [];
-
         const noSitesAlert = document.getElementById('noSites');
         const siteStatusTableBody = document.getElementById('siteStatusTableBody');
 
         if (sites.length === 0) {
             noSitesAlert.classList.remove('d-none');
-            siteStatusTableBody.innerHTML = '<tr><td colspan="6" class="text-center">No websites are being monitored.</td></tr>'; // Colspan updated
+            siteStatusTableBody.innerHTML = '<tr><td colspan="6" class="text-center">No websites are being monitored.</td></tr>';
             return;
         } else {
             noSitesAlert.classList.add('d-none');
         }
-
         renderSiteStatusTable(sites);
-
     } catch (error) {
         console.error('Error loading website statuses:', error);
         const siteStatusTableBody = document.getElementById('siteStatusTableBody');
-        siteStatusTableBody.innerHTML = '<tr><td colspan="6" class="text-center text-danger">Failed to load website status data. Please refresh the page.</td></tr>'; // Colspan updated
+        siteStatusTableBody.innerHTML = '<tr><td colspan="6" class="text-center text-danger">Failed to load website status data. Please refresh the page.</td></tr>';
     }
 }
 
-// Render the website status table
 async function renderSiteStatusTable(sites) {
     const tableBody = document.getElementById('siteStatusTableBody');
-    tableBody.innerHTML = ''; // Clear existing rows
+    tableBody.innerHTML = '';
 
     for (const site of sites) {
         const row = document.createElement('tr');
@@ -3569,7 +2844,7 @@ async function renderSiteStatusTable(sites) {
         const responseTime = site.last_response_time_ms !== null ? \`\${site.last_response_time_ms} ms\` : '-';
 
         const historyCell = document.createElement('td');
-        historyCell.innerHTML = '<div class="history-bar-container"></div>'; // Placeholder
+        historyCell.innerHTML = '<div class="history-bar-container"></div>';
 
         row.innerHTML = \`
             <td>\${site.name || '-'}</td>
@@ -3580,13 +2855,10 @@ async function renderSiteStatusTable(sites) {
         \`;
         row.appendChild(historyCell);
         tableBody.appendChild(row);
-
-        // Asynchronously fetch and render history for this site
         fetchAndRenderSiteHistory(site.id, historyCell.querySelector('.history-bar-container'));
     }
 }
 
-// Fetch and render 24h history for a site
 async function fetchAndRenderSiteHistory(siteId, containerElement) {
     try {
         const response = await fetch(\`/api/sites/\${siteId}/history\`);
@@ -3596,35 +2868,29 @@ async function fetchAndRenderSiteHistory(siteId, containerElement) {
             return;
         }
         const data = await response.json();
-        const fetchedHistory = data.history || []; // API now returns newest first
+        const fetchedHistory = data.history || [];
 
         let historyHtml = '';
         const now = new Date();
         
-        // Iterate over the last 24 hours, i=0 is current hour's slot, i=23 is 23 hours ago's slot
         for (let i = 0; i < 24; i++) {
             const slotTime = new Date(now);
-            slotTime.setHours(now.getHours() - i); // Sets the hour for the slot (e.g., if now=4:30, i=0 -> 4:xx, i=1 -> 3:xx)
+            slotTime.setHours(now.getHours() - i);
 
             const slotStart = new Date(slotTime);
-            slotStart.setMinutes(0, 0, 0); // Start of that hour, e.g., 4:00:00
+            slotStart.setMinutes(0, 0, 0);
 
             const slotEnd = new Date(slotTime);
-            slotEnd.setMinutes(59, 59, 999); // End of that hour, e.g., 4:59:59
+            slotEnd.setMinutes(59, 59, 999);
 
             const slotStartTimestamp = Math.floor(slotStart.getTime() / 1000);
             const slotEndTimestamp = Math.floor(slotEnd.getTime() / 1000);
 
-            // Find the most recent record within this hour slot
-            // fetchedHistory is newest first, so the first match is the most recent in the slot
             const recordForHour = fetchedHistory.find(
                 r => r.timestamp >= slotStartTimestamp && r.timestamp <= slotEndTimestamp
             );
-
             let barClass = 'history-bar-pending';
-            // Display slot time, e.g., "04:00 - 05:00"
             let titleText = \`\${String(slotStart.getHours()).padStart(2, '0')}:00 - \${String((slotStart.getHours() + 1) % 24).padStart(2, '0')}:00: No record\`;
-
             if (recordForHour) {
                 if (recordForHour.status === 'UP') {
                     barClass = 'history-bar-up';
@@ -3632,11 +2898,8 @@ async function fetchAndRenderSiteHistory(siteId, containerElement) {
                     barClass = 'history-bar-down';
                 }
                 const recordDate = new Date(recordForHour.timestamp * 1000);
-                // Keep detailed title if record exists
-                titleText = \`\${recordDate.toLocaleString()}: \${recordForHour.status} (\${recordForHour.status_code || 'N/A'}), \${recordForHour.response_time_ms || '-'}ms\`;
+                titleText = \`\${recordDate.toLocaleString()}: \${recordForHour.status} (\${recordForHour.status_code || 'N/A'}), \${recordForHour.response_time_ms || '-'}\`;
             }
-            // Append HTML. With flex-direction:row-reverse, first DOM element is rightmost.
-            // i=0 (current hour slot) is added first, so it will be the rightmost.
             historyHtml += \`<div class="history-bar \${barClass}" title="\${titleText}"></div>\`;
         }
         
@@ -3652,8 +2915,6 @@ async function fetchAndRenderSiteHistory(siteId, containerElement) {
     }
 }
 
-
-// Get website status badge class and text (copied from admin.js for reuse)
 function getSiteStatusBadge(status) {
     switch (status) {
         case 'UP': return { class: 'bg-success', text: '正常' };
@@ -3669,19 +2930,15 @@ function getSiteStatusBadge(status) {
 
 function getLoginJs() {
   return `// login.js - 登录页面的JavaScript逻辑
-
-// --- Theme Management (copied from main.js) ---
+// --- Theme Management ---
 const THEME_KEY = 'themePreference';
 const LIGHT_THEME = 'light';
 const DARK_THEME = 'dark';
-
 function initializeTheme() {
     const themeToggler = document.getElementById('themeToggler');
     if (!themeToggler) return;
-
     const storedTheme = localStorage.getItem(THEME_KEY) || LIGHT_THEME;
     applyTheme(storedTheme);
-
     themeToggler.addEventListener('click', () => {
         const currentTheme = document.documentElement.getAttribute('data-bs-theme');
         const newTheme = currentTheme === DARK_THEME ? LIGHT_THEME : DARK_THEME;
@@ -3689,9 +2946,8 @@ function initializeTheme() {
         localStorage.setItem(THEME_KEY, newTheme);
     });
 }
-
 function applyTheme(theme) {
-    document.title = \`Admin Panel - Theme: \${theme.toUpperCase()}\`; // Diagnostic line
+    document.title = \`Admin Panel - Theme: \${theme.toUpperCase()}\`;
     document.documentElement.setAttribute('data-bs-theme', theme);
     const themeTogglerIcon = document.querySelector('#themeToggler i');
     if (themeTogglerIcon) {
@@ -3706,57 +2962,34 @@ function applyTheme(theme) {
 }
 // --- End Theme Management ---
 
-
-// 页面加载完成后执行
 document.addEventListener('DOMContentLoaded', function() {
-    // Initialize theme
     initializeTheme();
-
-    // 获取登录表单元素
     const loginForm = document.getElementById('loginForm');
     const loginAlert = document.getElementById('loginAlert');
     
-    // 添加表单提交事件监听
     loginForm.addEventListener('submit', function(e) {
         e.preventDefault();
-        
-        // 获取用户输入
         const username = document.getElementById('username').value.trim();
         const password = document.getElementById('password').value.trim();
-        
-        // 验证输入
         if (!username || !password) {
             showLoginError('请输入用户名和密码');
             return;
         }
-        
-        // 执行登录
         login(username, password);
     });
-    
-    // 检查是否已登录
     checkLoginStatus();
 });
 
-// 检查登录状态
 async function checkLoginStatus() {
     try {
-        // 从localStorage获取token
         const token = localStorage.getItem('auth_token');
-        if (!token) {
-            return;
-        }
-        
+        if (!token) return;
         const response = await fetch('/api/auth/status', {
-            headers: {
-                'Authorization': \`Bearer \${token}\`
-            }
+            headers: { 'Authorization': \`Bearer \${token}\` }
         });
-        
         if (response.ok) {
             const data = await response.json();
             if (data.authenticated) {
-                // 已登录，重定向到管理后台
                 window.location.href = 'admin.html';
             }
         }
@@ -3765,36 +2998,24 @@ async function checkLoginStatus() {
     }
 }
 
-// 登录函数
 async function login(username, password) {
     try {
-        // 显示加载状态
         const submitBtn = loginForm.querySelector('button[type="submit"]');
         const originalBtnText = submitBtn.innerHTML;
         submitBtn.disabled = true;
         submitBtn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 登录中...';
-        
-        // 发送登录请求
         const response = await fetch('/api/auth/login', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ username, password })
         });
-        
-        // 恢复按钮状态
         submitBtn.disabled = false;
         submitBtn.innerHTML = originalBtnText;
-        
         if (response.ok) {
             const data = await response.json();
-            // 保存token到localStorage
             localStorage.setItem('auth_token', data.token);
-            // 登录成功，重定向到管理后台
             window.location.href = 'admin.html';
         } else {
-            // 登录失败
             const data = await response.json();
             showLoginError(data.message || '用户名或密码错误');
         }
@@ -3804,36 +3025,27 @@ async function login(username, password) {
     }
 }
 
-// 显示登录错误
 function showLoginError(message) {
     const loginAlert = document.getElementById('loginAlert');
     loginAlert.textContent = message;
     loginAlert.classList.remove('d-none');
-    
-    // 5秒后自动隐藏错误信息
     setTimeout(() => {
         loginAlert.classList.add('d-none');
     }, 5000);
 }`;
 }
-// Helper functions for updating server/site settings are no longer needed for frequent notifications
-// as that feature is removed.
 
 function getAdminJs() {
   return `// admin.js - 管理后台的JavaScript逻辑
-
-// --- Theme Management (copied from main.js) ---
+// --- Theme Management ---
 const THEME_KEY = 'themePreference';
 const LIGHT_THEME = 'light';
 const DARK_THEME = 'dark';
-
 function initializeTheme() {
     const themeToggler = document.getElementById('themeToggler');
     if (!themeToggler) return;
-
     const storedTheme = localStorage.getItem(THEME_KEY) || LIGHT_THEME;
     applyTheme(storedTheme);
-
     themeToggler.addEventListener('click', () => {
         const currentTheme = document.documentElement.getAttribute('data-bs-theme');
         const newTheme = currentTheme === DARK_THEME ? LIGHT_THEME : DARK_THEME;
@@ -3841,7 +3053,6 @@ function initializeTheme() {
         localStorage.setItem(THEME_KEY, newTheme);
     });
 }
-
 function applyTheme(theme) {
     document.documentElement.setAttribute('data-bs-theme', theme);
     const themeTogglerIcon = document.querySelector('#themeToggler i');
@@ -3857,59 +3068,37 @@ function applyTheme(theme) {
 }
 // --- End Theme Management ---
 
-
-// 全局变量
 let currentServerId = null;
-let currentSiteId = null; // For site deletion
+let currentSiteId = null;
 let serverList = [];
-let siteList = []; // For monitored sites
+let siteList = [];
 
-// 页面加载完成后执行
 document.addEventListener('DOMContentLoaded', function() {
-    // Initialize theme
     initializeTheme();
-
-    // 检查登录状态
     checkLoginStatus();
-    
-    // 初始化事件监听
     initEventListeners();
-    
-    // 加载服务器列表
     loadServerList();
-    // 加载监控网站列表
     loadSiteList();
-    // 加载Telegram设置
     loadTelegramSettings();
-    // 加载全局设置 (VPS Report Interval) - will use serverAlert for notifications
     loadGlobalSettings();
 });
 
-// 检查登录状态
 async function checkLoginStatus() {
     try {
-        // 从localStorage获取token
         const token = localStorage.getItem('auth_token');
         if (!token) {
-            // 未登录，重定向到登录页面
             window.location.href = 'login.html';
             return;
         }
-        
         const response = await fetch('/api/auth/status', {
-            headers: {
-                'Authorization': \`Bearer \${token}\`
-            }
+            headers: { 'Authorization': \`Bearer \${token}\` }
         });
-        
         if (response.ok) {
             const data = await response.json();
             if (!data.authenticated) {
-                // 未登录，重定向到登录页面
                 window.location.href = 'login.html';
             }
         } else {
-            // 请求失败，重定向到登录页面
             window.location.href = 'login.html';
         }
     } catch (error) {
@@ -3918,113 +3107,48 @@ async function checkLoginStatus() {
     }
 }
 
-// 初始化事件监听
 function initEventListeners() {
-    // 添加服务器按钮
-    document.getElementById('addServerBtn').addEventListener('click', function() {
-        showServerModal();
-    });
-    
-    // 保存服务器按钮
-    document.getElementById('saveServerBtn').addEventListener('click', function() {
-        saveServer();
-    });
+    document.getElementById('addServerBtn').addEventListener('click', function() { showServerModal(); });
+    document.getElementById('saveServerBtn').addEventListener('click', function() { saveServer(); });
+    document.getElementById('copyApiKeyBtn').addEventListener('click', function() { copyToClipboard(document.getElementById('apiKey').value, this); });
+    document.getElementById('copyServerIdBtn').addEventListener('click', function() { copyToClipboard(document.getElementById('serverIdDisplay').value, this); });
+    document.getElementById('copyWorkerUrlBtn').addEventListener('click', function() { copyToClipboard(document.getElementById('workerUrlDisplay').value, this); });
+    document.getElementById('confirmDeleteBtn').addEventListener('click', function() { if (currentServerId) deleteServer(currentServerId); });
+    document.getElementById('changePasswordBtn').addEventListener('click', function() { showPasswordModal(); });
+    document.getElementById('savePasswordBtn').addEventListener('click', function() { changePassword(); });
+    document.getElementById('logoutBtn').addEventListener('click', function() { logout(); });
+    document.getElementById('addSiteBtn').addEventListener('click', function() { showSiteModal(); });
+    document.getElementById('saveSiteBtn').addEventListener('click', function() { saveSite(); });
+    document.getElementById('confirmDeleteSiteBtn').addEventListener('click', function() { if (currentSiteId) deleteSite(currentSiteId); });
+    document.getElementById('saveTelegramSettingsBtn').addEventListener('click', function() { saveTelegramSettings(); });
+    document.getElementById('saveVpsReportIntervalBtn').addEventListener('click', function() { saveVpsReportInterval(); });
+}
 
-    // Helper function for copying text to clipboard and providing button feedback
-    function copyToClipboard(textToCopy, buttonElement) {
-        navigator.clipboard.writeText(textToCopy).then(() => {
-            const originalHtml = buttonElement.innerHTML;
-            buttonElement.innerHTML = '<i class="bi bi-check-lg"></i>'; // Using a larger check icon
-            buttonElement.classList.add('btn-success');
-            buttonElement.classList.remove('btn-outline-secondary');
-            
-            setTimeout(() => {
-                buttonElement.innerHTML = originalHtml;
-                buttonElement.classList.remove('btn-success');
-                buttonElement.classList.add('btn-outline-secondary');
-            }, 2000);
-        }).catch(err => {
-            console.error('Failed to copy text: ', err);
-            // Optionally, show an error message to the user
-            const originalHtml = buttonElement.innerHTML;
-            buttonElement.innerHTML = '<i class="bi bi-x-lg"></i>'; // Error icon
-            buttonElement.classList.add('btn-danger');
-            buttonElement.classList.remove('btn-outline-secondary');
-            setTimeout(() => {
-                buttonElement.innerHTML = originalHtml;
-                buttonElement.classList.remove('btn-danger');
-                buttonElement.classList.add('btn-outline-secondary');
-            }, 2000);
-        });
-    }
-    
-    // 复制API密钥按钮
-    document.getElementById('copyApiKeyBtn').addEventListener('click', function() {
-        const apiKeyInput = document.getElementById('apiKey');
-        copyToClipboard(apiKeyInput.value, this);
-    });
-
-    // 复制服务器ID按钮
-    document.getElementById('copyServerIdBtn').addEventListener('click', function() {
-        const serverIdInput = document.getElementById('serverIdDisplay');
-        copyToClipboard(serverIdInput.value, this);
-    });
-
-    // 复制Worker地址按钮
-    document.getElementById('copyWorkerUrlBtn').addEventListener('click', function() {
-        const workerUrlInput = document.getElementById('workerUrlDisplay');
-        copyToClipboard(workerUrlInput.value, this);
-    });
-    
-    // 确认删除按钮
-    document.getElementById('confirmDeleteBtn').addEventListener('click', function() {
-        if (currentServerId) {
-            deleteServer(currentServerId);
-        }
-    });
-    
-    // 修改密码按钮
-    document.getElementById('changePasswordBtn').addEventListener('click', function() {
-        showPasswordModal();
-    });
-    
-    // 保存密码按钮
-    document.getElementById('savePasswordBtn').addEventListener('click', function() {
-        changePassword();
-    });
-    
-    // 退出登录按钮
-    document.getElementById('logoutBtn').addEventListener('click', function() {
-        logout();
-    });
-
-    // --- Site Monitoring Event Listeners ---
-    document.getElementById('addSiteBtn').addEventListener('click', function() {
-        showSiteModal();
-    });
-
-    document.getElementById('saveSiteBtn').addEventListener('click', function() {
-        saveSite();
-    });
-
-     document.getElementById('confirmDeleteSiteBtn').addEventListener('click', function() {
-        if (currentSiteId) {
-            deleteSite(currentSiteId);
-        }
-    });
-
-    // 保存Telegram设置按钮
-    document.getElementById('saveTelegramSettingsBtn').addEventListener('click', function() {
-        saveTelegramSettings();
-    });
-
-    // Global Settings Event Listener
-    document.getElementById('saveVpsReportIntervalBtn').addEventListener('click', function() {
-        saveVpsReportInterval();
+function copyToClipboard(textToCopy, buttonElement) {
+    navigator.clipboard.writeText(textToCopy).then(() => {
+        const originalHtml = buttonElement.innerHTML;
+        buttonElement.innerHTML = '<i class="bi bi-check-lg"></i>';
+        buttonElement.classList.add('btn-success');
+        buttonElement.classList.remove('btn-outline-secondary');
+        setTimeout(() => {
+            buttonElement.innerHTML = originalHtml;
+            buttonElement.classList.remove('btn-success');
+            buttonElement.classList.add('btn-outline-secondary');
+        }, 2000);
+    }).catch(err => {
+        console.error('Failed to copy text: ', err);
+        const originalHtml = buttonElement.innerHTML;
+        buttonElement.innerHTML = '<i class="bi bi-x-lg"></i>';
+        buttonElement.classList.add('btn-danger');
+        buttonElement.classList.remove('btn-outline-secondary');
+        setTimeout(() => {
+            buttonElement.innerHTML = originalHtml;
+            buttonElement.classList.remove('btn-danger');
+            buttonElement.classList.add('btn-outline-secondary');
+        }, 2000);
     });
 }
 
-// 获取认证头
 function getAuthHeaders() {
     const token = localStorage.getItem('auth_token');
     return {
@@ -4033,44 +3157,12 @@ function getAuthHeaders() {
     };
 }
 
-// 加载服务器列表
 async function loadServerList() {
     try {
-        const response = await fetch('/api/admin/servers', {
-            headers: getAuthHeaders()
-        });
-        
-        if (!response.ok) {
-            throw new Error('获取服务器列表失败');
-        }
-        
+        const response = await fetch('/api/admin/servers', { headers: getAuthHeaders() });
+        if (!response.ok) throw new Error('获取服务器列表失败');
         const data = await response.json();
         serverList = data.servers || [];
-        
-        renderServerTable(serverList);
-    } catch (error) {
-        console.error('加载服务器列表错误:', error);
-        showAlert('danger', '加载服务器列表失败，请刷新页面重试。');
-    }
-}
-
-
-// --- Server Management Functions ---
-
-// 加载服务器列表
-async function loadServerList() {
-    try {
-        const response = await fetch('/api/admin/servers', {
-            headers: getAuthHeaders()
-        });
-
-        if (!response.ok) {
-            throw new Error('获取服务器列表失败');
-        }
-
-        const data = await response.json();
-        serverList = data.servers || [];
-
         renderServerTable(serverList);
     } catch (error) {
         console.error('加载服务器列表错误:', error);
@@ -4078,33 +3170,23 @@ async function loadServerList() {
     }
 }
 
-// 渲染服务器表格
 function renderServerTable(servers) {
     const tableBody = document.getElementById('serverTableBody');
     tableBody.innerHTML = '';
-    
     if (servers.length === 0) {
-        const row = document.createElement('tr');
-        row.innerHTML = '<td colspan="9" class="text-center">暂无服务器数据</td>'; // Updated colspan
-        tableBody.appendChild(row);
+        tableBody.innerHTML = '<tr><td colspan="9" class="text-center">暂无服务器数据</td></tr>';
         return;
     }
     
     servers.forEach((server, index) => {
         const row = document.createElement('tr');
-        
-        // 格式化最后更新时间
         let lastUpdateText = '从未';
         let statusBadge = '<span class="badge bg-secondary">未知</span>';
-        
         if (server.last_report) {
             const lastUpdate = new Date(server.last_report * 1000);
             lastUpdateText = lastUpdate.toLocaleString();
-            
-            // 检查是否在线（最后报告时间在5分钟内）
             const now = new Date();
             const diffMinutes = (now - lastUpdate) / (1000 * 60);
-            
             if (diffMinutes <= 5) {
                 statusBadge = '<span class="badge bg-success">在线</span>';
             } else {
@@ -4115,12 +3197,8 @@ function renderServerTable(servers) {
         row.innerHTML = \`
             <td>
                 <div class="btn-group">
-                     <button class="btn btn-sm btn-outline-secondary move-server-btn" data-id="\${server.id}" data-direction="up" \${index === 0 ? 'disabled' : ''}>
-                        <i class="bi bi-arrow-up"></i>
-                    </button>
-                     <button class="btn btn-sm btn-outline-secondary move-server-btn" data-id="\${server.id}" data-direction="down" \${index === servers.length - 1 ? 'disabled' : ''}>
-                        <i class="bi bi-arrow-down"></i>
-                    </button>
+                     <button class="btn btn-sm btn-outline-secondary move-server-btn" data-id="\${server.id}" data-direction="up" \${index === 0 ? 'disabled' : ''}><i class="bi bi-arrow-up"></i></button>
+                     <button class="btn btn-sm btn-outline-secondary move-server-btn" data-id="\${server.id}" data-direction="down" \${index === servers.length - 1 ? 'disabled' : ''}><i class="bi bi-arrow-down"></i></button>
                 </div>
             </td>
             <td>\${server.id}</td>
@@ -4129,98 +3207,40 @@ function renderServerTable(servers) {
             <td>\${statusBadge}</td>
             <td>\${lastUpdateText}</td>
             <td>
-                <button class="btn btn-sm btn-outline-secondary view-key-btn" data-id="\${server.id}">
-                    <i class="bi bi-key"></i> 查看密钥
-                </button>
+                <button class="btn btn-sm btn-outline-secondary view-key-btn" data-id="\${server.id}"><i class="bi bi-key"></i> 查看密钥</button>
             </td>
             <td>
-                <button class="btn btn-sm btn-outline-info copy-vps-script-btn" data-id="\${server.id}" data-name="\${server.name}" title="复制VPS安装脚本">
-                    <i class="bi bi-clipboard-plus"></i> 复制脚本
-                </button>
+                <button class="btn btn-sm btn-outline-info copy-vps-script-btn" data-id="\${server.id}" data-name="\${server.name}" title="复制VPS安装脚本"><i class="bi bi-clipboard-plus"></i> 复制脚本</button>
             </td>
-            <!-- Removed frequent notification toggle column -->
             <td>
                 <div class="btn-group">
-                    <button class="btn btn-sm btn-outline-primary edit-server-btn" data-id="\${server.id}">
-                        <i class="bi bi-pencil"></i>
-                    </button>
-                    <button class="btn btn-sm btn-outline-danger delete-server-btn" data-id="\${server.id}" data-name="\${server.name}">
-                        <i class="bi bi-trash"></i>
-                    </button>
+                    <button class="btn btn-sm btn-outline-primary edit-server-btn" data-id="\${server.id}"><i class="bi bi-pencil"></i></button>
+                    <button class="btn btn-sm btn-outline-danger delete-server-btn" data-id="\${server.id}" data-name="\${server.name}"><i class="bi bi-trash"></i></button>
                 </div>
             </td>
         \`;
-
         tableBody.appendChild(row);
     });
     
-    // 添加事件监听
-    document.querySelectorAll('.view-key-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const serverId = this.getAttribute('data-id');
-            viewApiKey(serverId);
-        });
-    });
-    
-    document.querySelectorAll('.edit-server-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const serverId = this.getAttribute('data-id');
-            editServer(serverId);
-        });
-    });
-    
-    document.querySelectorAll('.delete-server-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const serverId = this.getAttribute('data-id');
-            const serverName = this.getAttribute('data-name');
-            showDeleteConfirmation(serverId, serverName);
-        });
-    });
-
-    document.querySelectorAll('.move-server-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const serverId = this.getAttribute('data-id');
-            const direction = this.getAttribute('data-direction');
-            moveServer(serverId, direction);
-        });
-    });
-
-    document.querySelectorAll('.copy-vps-script-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const serverId = this.getAttribute('data-id');
-            const serverName = this.getAttribute('data-name');
-            copyVpsInstallScript(serverId, serverName, this);
-        });
-    });
-
-    // Removed event listener for server-frequent-notify-toggle as it's deleted from HTML
+    document.querySelectorAll('.view-key-btn').forEach(btn => btn.addEventListener('click', function() { viewApiKey(this.getAttribute('data-id')); }));
+    document.querySelectorAll('.edit-server-btn').forEach(btn => btn.addEventListener('click', function() { editServer(this.getAttribute('data-id')); }));
+    document.querySelectorAll('.delete-server-btn').forEach(btn => btn.addEventListener('click', function() { showDeleteConfirmation(this.getAttribute('data-id'), this.getAttribute('data-name')); }));
+    document.querySelectorAll('.move-server-btn').forEach(btn => btn.addEventListener('click', function() { moveServer(this.getAttribute('data-id'), this.getAttribute('data-direction')); }));
+    document.querySelectorAll('.copy-vps-script-btn').forEach(btn => btn.addEventListener('click', function() { copyVpsInstallScript(this.getAttribute('data-id'), this.getAttribute('data-name'), this); }));
 }
 
-
-// Function to copy VPS installation script
 async function copyVpsInstallScript(serverId, serverName, buttonElement) {
     const originalButtonHtml = buttonElement.innerHTML;
     buttonElement.disabled = true;
     buttonElement.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> 获取中...';
-
     try {
-        const apiKeyResponse = await fetch(\`/api/admin/servers/\${serverId}/key\`, {
-            headers: getAuthHeaders()
-        });
-
-        if (!apiKeyResponse.ok) {
-            const errorData = await apiKeyResponse.json().catch(() => ({}));
-            throw new Error(errorData.message || '获取API密钥失败');
-        }
+        const apiKeyResponse = await fetch(\`/api/admin/servers/\${serverId}/key\`, { headers: getAuthHeaders() });
+        if (!apiKeyResponse.ok) throw new Error('获取API密钥失败');
         const apiKeyData = await apiKeyResponse.json();
         const apiKey = apiKeyData.api_key;
+        if (!apiKey) throw new Error('未能获取到API密钥');
 
-        if (!apiKey) {
-            throw new Error('未能获取到API密钥');
-        }
-
-        // Fetch the current global VPS report interval
-        let vpsReportInterval = 60; // Default if fetch fails
+        let vpsReportInterval = 60;
         try {
             const intervalResponse = await fetch('/api/admin/settings/vps-report-interval', { headers: getAuthHeaders() });
             if (intervalResponse.ok) {
@@ -4228,27 +3248,17 @@ async function copyVpsInstallScript(serverId, serverName, buttonElement) {
                 if (intervalData && typeof intervalData.interval === 'number' && intervalData.interval > 0) {
                     vpsReportInterval = intervalData.interval;
                 }
-            } else {
-                console.warn('Failed to fetch VPS report interval for script, using default.');
             }
-        } catch (e) {
-            console.warn('Error fetching VPS report interval for script, using default:', e);
-        }
+        } catch (e) {}
         
         const workerUrl = window.location.origin;
-        // The base script command provided by the user
-        const baseScriptUrl = "https://raw.githubusercontent.com/kadidalax/cf-vps-monitor/main/cf-vps-monitor.sh";
-        // Include the fetched interval in the script command
-        const scriptCommand = \`wget \${baseScriptUrl} -O cf-vps-monitor.sh && chmod +x cf-vps-monitor.sh && ./cf-vps-monitor.sh -i -k \${apiKey} -s \${serverId} -u \${workerUrl} --interval \${vpsReportInterval}\`;
+        const scriptCommand = \`curl -fsSL "\${workerUrl}/install.sh" -o install.sh && chmod +x install.sh && sudo ./install.sh -k \${apiKey} -s \${serverId} -u \${workerUrl}\`;
         
         await navigator.clipboard.writeText(scriptCommand);
-        
         buttonElement.innerHTML = '<i class="bi bi-check-lg"></i> 已复制!';
         buttonElement.classList.remove('btn-outline-info');
         buttonElement.classList.add('btn-success');
-        
         showAlert('success', \`服务器 "\${serverName}" 的安装脚本已复制到剪贴板。\`, 'serverAlert');
-
     } catch (error) {
         console.error('复制VPS安装脚本错误:', error);
         showAlert('danger', \`复制脚本失败: \${error.message}\`, 'serverAlert');
@@ -4261,11 +3271,10 @@ async function copyVpsInstallScript(serverId, serverName, buttonElement) {
             buttonElement.innerHTML = originalButtonHtml;
             buttonElement.classList.remove('btn-success', 'btn-danger');
             buttonElement.classList.add('btn-outline-info');
-        }, 3000); // Revert button state after 3 seconds
+        }, 3000);
     }
 }
 
-// 移动服务器顺序
 async function moveServer(serverId, direction) {
     try {
         const response = await fetch(\`/api/admin/servers/\${serverId}/reorder\`, {
@@ -4273,115 +3282,67 @@ async function moveServer(serverId, direction) {
             headers: getAuthHeaders(),
             body: JSON.stringify({ direction })
         });
-
-        if (!response.ok) {
-             const errorData = await response.json();
-             throw new Error(errorData.message || '移动服务器失败');
-        }
-
-        // 重新加载列表以反映新顺序
+        if (!response.ok) throw new Error('移动服务器失败');
         await loadServerList();
         showAlert('success', '服务器已成功' + (direction === 'up' ? '上移' : '下移'));
-
     } catch (error) {
         console.error('移动服务器错误:', error);
         showAlert('danger', \`移动服务器失败: \${error.message}\`, 'serverAlert');
     }
 }
 
-// 显示服务器模态框（添加模式）
 function showServerModal() {
-    // 重置表单
     document.getElementById('serverForm').reset();
     document.getElementById('serverId').value = '';
     document.getElementById('apiKeyGroup').classList.add('d-none');
     document.getElementById('serverIdDisplayGroup').classList.add('d-none');
     document.getElementById('workerUrlDisplayGroup').classList.add('d-none');
-    
-    // 设置模态框标题
     document.getElementById('serverModalTitle').textContent = '添加服务器';
-    
-    // 显示模态框
-    const serverModal = new bootstrap.Modal(document.getElementById('serverModal'));
-    serverModal.show();
+    new bootstrap.Modal(document.getElementById('serverModal')).show();
 }
 
-// 编辑服务器
 function editServer(serverId) {
     const server = serverList.find(s => s.id === serverId);
     if (!server) return;
-    
-    // 填充表单
     document.getElementById('serverId').value = server.id;
     document.getElementById('serverName').value = server.name;
     document.getElementById('serverDescription').value = server.description || '';
     document.getElementById('apiKeyGroup').classList.add('d-none');
     document.getElementById('serverIdDisplayGroup').classList.add('d-none');
     document.getElementById('workerUrlDisplayGroup').classList.add('d-none');
-    
-    // 设置模态框标题
     document.getElementById('serverModalTitle').textContent = '编辑服务器';
-    
-    // 显示模态框
-    const serverModal = new bootstrap.Modal(document.getElementById('serverModal'));
-    serverModal.show();
+    new bootstrap.Modal(document.getElementById('serverModal')).show();
 }
 
-// 保存服务器
 async function saveServer() {
     const serverId = document.getElementById('serverId').value;
     const serverName = document.getElementById('serverName').value.trim();
     const serverDescription = document.getElementById('serverDescription').value.trim();
-    // const enableFrequentNotifications = document.getElementById('serverEnableFrequentNotifications').checked; // Removed
-    
     if (!serverName) {
-        showAlert('danger', '服务器名称不能为空', 'serverAlert'); // Added alertId
+        showAlert('danger', '服务器名称不能为空', 'serverAlert');
         return;
     }
-    
     try {
         let response;
-        let data;
-        
         if (serverId) {
-            // 更新服务器
             response = await fetch(\`/api/admin/servers/\${serverId}\`, {
                 method: 'PUT',
                 headers: getAuthHeaders(),
-                body: JSON.stringify({
-                    name: serverName,
-                    description: serverDescription
-                    // enable_frequent_down_notifications: enableFrequentNotifications // Removed
-                })
+                body: JSON.stringify({ name: serverName, description: serverDescription })
             });
         } else {
-            // 添加服务器
             response = await fetch('/api/admin/servers', {
                 method: 'POST',
                 headers: getAuthHeaders(),
-                body: JSON.stringify({
-                    name: serverName,
-                    description: serverDescription
-                    // enable_frequent_down_notifications: enableFrequentNotifications // Removed
-                })
+                body: JSON.stringify({ name: serverName, description: serverDescription })
             });
         }
-        
-        if (!response.ok) {
-            throw new Error('保存服务器失败');
-        }
-        
-        data = await response.json();
-        
-        // 隐藏模态框
-        const serverModal = bootstrap.Modal.getInstance(document.getElementById('serverModal'));
-        serverModal.hide();
-        
-        // 如果是新添加的服务器，显示API密钥
+        if (!response.ok) throw new Error('保存服务器失败');
+        const data = await response.json();
+        bootstrap.Modal.getInstance(document.getElementById('serverModal')).hide();
         if (!serverId && data.server && data.server.api_key) {
             showApiKey(data.server);
         } else {
-            // 重新加载服务器列表
             loadServerList();
             showAlert('success', serverId ? '服务器更新成功' : '服务器添加成功');
         }
@@ -4391,27 +3352,15 @@ async function saveServer() {
     }
 }
 
-// 查看API密钥
 async function viewApiKey(serverId) {
     try {
-        const response = await fetch(\`/api/admin/servers/\${serverId}/key\`, {
-            headers: getAuthHeaders()
-        });
-        
-        if (!response.ok) {
-            throw new Error('获取API密钥失败');
-        }
+        const response = await fetch(\`/api/admin/servers/\${serverId}/key\`, { headers: getAuthHeaders() });
+        if (!response.ok) throw new Error('获取API密钥失败');
         const data = await response.json();
         if (data.api_key) {
-            // Find the server details from the cached list
             const server = serverList.find(s => s.id === serverId);
-            if (server) {
-                // Create a temporary object with the fetched key
-                const serverWithKey = { ...server, api_key: data.api_key };
-                showApiKey(serverWithKey); // Pass the complete server object
-            } else {
-                 showAlert('danger', '未找到服务器信息', 'serverAlert');
-            }
+            if (server) showApiKey({ ...server, api_key: data.api_key });
+            else showAlert('danger', '未找到服务器信息', 'serverAlert');
         } else {
             showAlert('danger', '获取API密钥失败', 'serverAlert');
         }
@@ -4421,57 +3370,31 @@ async function viewApiKey(serverId) {
     }
 }
 
-// 显示API密钥
 function showApiKey(server) {
-    // 填充表单
-    document.getElementById('serverId').value = server.id; // Hidden input for form submission if needed
+    document.getElementById('serverId').value = server.id;
     document.getElementById('serverName').value = server.name;
     document.getElementById('serverDescription').value = server.description || '';
-    
-    // Populate and show API Key, Server ID, and Worker URL
     document.getElementById('apiKey').value = server.api_key;
     document.getElementById('apiKeyGroup').classList.remove('d-none');
-
     document.getElementById('serverIdDisplay').value = server.id;
     document.getElementById('serverIdDisplayGroup').classList.remove('d-none');
-
     document.getElementById('workerUrlDisplay').value = window.location.origin;
     document.getElementById('workerUrlDisplayGroup').classList.remove('d-none');
-    
-    // 设置模态框标题
     document.getElementById('serverModalTitle').textContent = '服务器详细信息与密钥';
-    
-    // 显示模态框
-    const serverModal = new bootstrap.Modal(document.getElementById('serverModal'));
-    serverModal.show();
+    new bootstrap.Modal(document.getElementById('serverModal')).show();
 }
 
-// 显示删除确认
 function showDeleteConfirmation(serverId, serverName) {
     currentServerId = serverId;
     document.getElementById('deleteServerName').textContent = serverName;
-    
-    const deleteModal = new bootstrap.Modal(document.getElementById('deleteModal'));
-    deleteModal.show();
+    new bootstrap.Modal(document.getElementById('deleteModal')).show();
 }
 
-// 删除服务器
 async function deleteServer(serverId) {
     try {
-        const response = await fetch(\`/api/admin/servers/\${serverId}\`, {
-            method: 'DELETE',
-            headers: getAuthHeaders()
-        });
-        
-        if (!response.ok) {
-            throw new Error('删除服务器失败');
-        }
-        
-        // 隐藏模态框
-        const deleteModal = bootstrap.Modal.getInstance(document.getElementById('deleteModal'));
-        deleteModal.hide();
-        
-        // 重新加载服务器列表
+        const response = await fetch(\`/api/admin/servers/\${serverId}\`, { method: 'DELETE', headers: getAuthHeaders() });
+        if (!response.ok) throw new Error('删除服务器失败');
+        bootstrap.Modal.getInstance(document.getElementById('deleteModal')).hide();
         loadServerList();
         showAlert('success', '服务器删除成功');
     } catch (error) {
@@ -4480,10 +3403,6 @@ async function deleteServer(serverId) {
     }
 }
 
-
-// --- Site Monitoring Functions (Continued) ---
-
-// 移动网站顺序
 async function moveSite(siteId, direction) {
     try {
         const response = await fetch(\`/api/admin/sites/\${siteId}/reorder\`, {
@@ -4491,68 +3410,42 @@ async function moveSite(siteId, direction) {
             headers: getAuthHeaders(),
             body: JSON.stringify({ direction })
         });
-
-        if (!response.ok) {
-             const errorData = await response.json().catch(() => ({}));
-             throw new Error(errorData.message || '移动网站失败');
-        }
-
-        // 重新加载列表以反映新顺序
+        if (!response.ok) throw new Error('移动网站失败');
         await loadSiteList();
         showAlert('success', '网站已成功' + (direction === 'up' ? '上移' : '下移'), 'siteAlert');
-
     } catch (error) {
         console.error('移动网站错误:', error);
         showAlert('danger', \`移动网站失败: \${error.message}\`, 'siteAlert');
     }
 }
 
-
-// --- Password Management Functions ---
-
-// 显示密码修改模态框
 function showPasswordModal() {
-    // 重置表单
     document.getElementById('passwordForm').reset();
     document.getElementById('passwordAlert').classList.add('d-none');
-    
-    const passwordModal = new bootstrap.Modal(document.getElementById('passwordModal'));
-    passwordModal.show();
+    new bootstrap.Modal(document.getElementById('passwordModal')).show();
 }
 
-// 修改密码
 async function changePassword() {
     const currentPassword = document.getElementById('currentPassword').value;
     const newPassword = document.getElementById('newPassword').value;
     const confirmPassword = document.getElementById('confirmPassword').value;
-    
-    // 验证输入
     if (!currentPassword || !newPassword || !confirmPassword) {
         showPasswordAlert('danger', '所有密码字段都必须填写');
         return;
     }
-    
     if (newPassword !== confirmPassword) {
         showPasswordAlert('danger', '新密码和确认密码不匹配');
         return;
     }
-    
     try {
         const response = await fetch('/api/auth/change-password', {
             method: 'POST',
             headers: getAuthHeaders(),
-            body: JSON.stringify({
-                current_password: currentPassword,
-                new_password: newPassword
-            })
+            body: JSON.stringify({ current_password: currentPassword, new_password: newPassword })
         });
-        
         if (response.ok) {
-            // 隐藏模态框
-            const passwordModal = bootstrap.Modal.getInstance(document.getElementById('passwordModal'));
-            passwordModal.hide();
-            
-            showAlert('success', '密码修改成功', 'serverAlert'); // Use main alert
+            bootstrap.Modal.getInstance(document.getElementById('passwordModal')).hide();
+            showAlert('success', '密码修改成功', 'serverAlert');
         } else {
             const data = await response.json();
             showPasswordAlert('danger', data.message || '密码修改失败');
@@ -4563,31 +3456,15 @@ async function changePassword() {
     }
 }
 
-
-// --- Auth Functions ---
-
-// 退出登录
 function logout() {
-    // 清除localStorage中的token
     localStorage.removeItem('auth_token');
-    
-    // 重定向到登录页面
     window.location.href = 'login.html';
 }
 
-
-// --- Site Monitoring Functions ---
-
-// 加载监控网站列表
 async function loadSiteList() {
     try {
-        const response = await fetch('/api/admin/sites', {
-            headers: getAuthHeaders()
-        });
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.message || '获取监控网站列表失败');
-        }
+        const response = await fetch('/api/admin/sites', { headers: getAuthHeaders() });
+        if (!response.ok) throw new Error('获取监控网站列表失败');
         const data = await response.json();
         siteList = data.sites || [];
         renderSiteTable(siteList);
@@ -4597,31 +3474,23 @@ async function loadSiteList() {
     }
 }
 
-// 渲染监控网站表格
 function renderSiteTable(sites) {
     const tableBody = document.getElementById('siteTableBody');
     tableBody.innerHTML = '';
-
     if (sites.length === 0) {
-        tableBody.innerHTML = '<tr><td colspan="9" class="text-center">暂无监控网站</td></tr>'; // Colspan updated
+        tableBody.innerHTML = '<tr><td colspan="10" class="text-center">暂无监控网站</td></tr>';
         return;
     }
-
-    sites.forEach((site, index) => { // Added index for sorting buttons
+    sites.forEach((site, index) => {
         const row = document.createElement('tr');
         const statusInfo = getSiteStatusBadge(site.last_status);
         const lastCheckTime = site.last_checked ? new Date(site.last_checked * 1000).toLocaleString() : '从未';
         const responseTime = site.last_response_time_ms !== null ? \`\${site.last_response_time_ms} ms\` : '-';
-
         row.innerHTML = \`
              <td>
-                <div class="btn-group btn-group-sm">
-                     <button class="btn btn-outline-secondary move-site-btn" data-id="\${site.id}" data-direction="up" \${index === 0 ? 'disabled' : ''} title="上移">
-                        <i class="bi bi-arrow-up"></i>
-                    </button>
-                     <button class="btn btn-outline-secondary move-site-btn" data-id="\${site.id}" data-direction="down" \${index === sites.length - 1 ? 'disabled' : ''} title="下移">
-                        <i class="bi bi-arrow-down"></i>
-                    </button>
+                 <div class="btn-group btn-group-sm">
+                     <button class="btn btn-outline-secondary move-site-btn" data-id="\${site.id}" data-direction="up" \${index === 0 ? 'disabled' : ''} title="上移"><i class="bi bi-arrow-up"></i></button>
+                     <button class="btn btn-outline-secondary move-site-btn" data-id="\${site.id}" data-direction="down" \${index === sites.length - 1 ? 'disabled' : ''} title="下移"><i class="bi bi-arrow-down"></i></button>
                 </div>
             </td>
             <td>\${site.name || '-'}</td>
@@ -4630,51 +3499,20 @@ function renderSiteTable(sites) {
             <td>\${site.last_status_code || '-'}</td>
             <td>\${responseTime}</td>
             <td>\${lastCheckTime}</td>
-            <!-- Removed frequent notification toggle column -->
             <td>
                 <div class="btn-group">
-                    <button class="btn btn-sm btn-outline-primary edit-site-btn" data-id="\${site.id}" title="编辑">
-                        <i class="bi bi-pencil"></i>
-                    </button>
-                    <button class="btn btn-sm btn-outline-danger delete-site-btn" data-id="\${site.id}" data-name="\${site.name || site.url}" data-url="\${site.url}" title="删除">
-                        <i class="bi bi-trash"></i>
-                    </button>
+                    <button class="btn btn-sm btn-outline-primary edit-site-btn" data-id="\${site.id}" title="编辑"><i class="bi bi-pencil"></i></button>
+                    <button class="btn btn-sm btn-outline-danger delete-site-btn" data-id="\${site.id}" data-name="\${site.name || site.url}" data-url="\${site.url}" title="删除"><i class="bi bi-trash"></i></button>
                 </div>
             </td>
         \`;
         tableBody.appendChild(row);
     });
-
-    // Add event listeners for edit and delete buttons
-    document.querySelectorAll('.edit-site-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const siteId = this.getAttribute('data-id');
-            editSite(siteId);
-        });
-    });
-
-    document.querySelectorAll('.delete-site-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const siteId = this.getAttribute('data-id');
-            const siteName = this.getAttribute('data-name');
-            const siteUrl = this.getAttribute('data-url');
-            showDeleteSiteConfirmation(siteId, siteName, siteUrl);
-        });
-    });
-
-    // Add event listeners for move buttons
-    document.querySelectorAll('.move-site-btn').forEach(btn => {
-        btn.addEventListener('click', function() {
-            const siteId = this.getAttribute('data-id');
-            const direction = this.getAttribute('data-direction');
-            moveSite(siteId, direction);
-        });
-    });
-
-    // Removed event listener for site-frequent-notify-toggle as it's deleted from HTML
+    document.querySelectorAll('.edit-site-btn').forEach(btn => btn.addEventListener('click', function() { editSite(this.getAttribute('data-id')); }));
+    document.querySelectorAll('.delete-site-btn').forEach(btn => btn.addEventListener('click', function() { showDeleteSiteConfirmation(this.getAttribute('data-id'), this.getAttribute('data-name'), this.getAttribute('data-url')); }));
+    document.querySelectorAll('.move-site-btn').forEach(btn => btn.addEventListener('click', function() { moveSite(this.getAttribute('data-id'), this.getAttribute('data-direction')); }));
 }
 
-// 获取网站状态对应的Badge样式和文本
 function getSiteStatusBadge(status) {
     switch (status) {
         case 'UP': return { class: 'bg-success', text: '正常' };
@@ -4686,14 +3524,10 @@ function getSiteStatusBadge(status) {
     }
 }
 
-
-// 显示添加/编辑网站模态框 (handles both add and edit)
 function showSiteModal(siteIdToEdit = null) {
-    const form = document.getElementById('siteForm');
-    form.reset();
+    document.getElementById('siteForm').reset();
     const modalTitle = document.getElementById('siteModalTitle');
     const siteIdInput = document.getElementById('siteId');
-
     if (siteIdToEdit) {
         const site = siteList.find(s => s.id === siteIdToEdit);
         if (site) {
@@ -4701,158 +3535,100 @@ function showSiteModal(siteIdToEdit = null) {
             siteIdInput.value = site.id;
             document.getElementById('siteName').value = site.name || '';
             document.getElementById('siteUrl').value = site.url;
-            // document.getElementById('siteEnableFrequentNotifications').checked = site.enable_frequent_down_notifications || false; // Removed
         } else {
             showAlert('danger', '未找到要编辑的网站信息。', 'siteAlert');
             return;
         }
     } else {
         modalTitle.textContent = '添加监控网站';
-        siteIdInput.value = ''; // Clear ID for add mode
-        // document.getElementById('siteEnableFrequentNotifications').checked = false; // Removed
+        siteIdInput.value = '';
     }
-
-    const siteModal = new bootstrap.Modal(document.getElementById('siteModal'));
-    siteModal.show();
+    new bootstrap.Modal(document.getElementById('siteModal')).show();
 }
 
-// Function to call when edit button is clicked
 function editSite(siteId) {
     showSiteModal(siteId);
 }
 
-// 保存网站（添加或更新）
 async function saveSite() {
-    const siteId = document.getElementById('siteId').value; // Get ID from hidden input
+    const siteId = document.getElementById('siteId').value;
     const siteName = document.getElementById('siteName').value.trim();
     const siteUrl = document.getElementById('siteUrl').value.trim();
-    // const enableFrequentNotifications = document.getElementById('siteEnableFrequentNotifications').checked; // Removed
-
     if (!siteUrl) {
         showAlert('warning', '请输入网站URL', 'siteAlert');
         return;
     }
     if (!siteUrl.startsWith('http://') && !siteUrl.startsWith('https://')) {
          showAlert('warning', 'URL必须以 http:// 或 https:// 开头', 'siteAlert');
-         return;
+        return;
     }
-
-    const requestBody = {
-        url: siteUrl,
-        name: siteName
-        // enable_frequent_down_notifications: enableFrequentNotifications // Removed
-    };
+    const requestBody = { url: siteUrl, name: siteName };
     let apiUrl = '/api/admin/sites';
     let method = 'POST';
-
-    if (siteId) { // If siteId exists, it's an update
+    if (siteId) {
         apiUrl = \`/api/admin/sites/\${siteId}\`;
         method = 'PUT';
     }
-
     try {
         const response = await fetch(apiUrl, {
             method: method,
             headers: getAuthHeaders(),
             body: JSON.stringify(requestBody)
         });
-
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.message || \`\${siteId ? '更新' : '添加'}网站失败 (\${response.status})\`);
-        }
-        
-        const responseData = await response.json();
-
-        const siteModalInstance = bootstrap.Modal.getInstance(document.getElementById('siteModal'));
-        if (siteModalInstance) {
-            siteModalInstance.hide();
-        }
-        
-        await loadSiteList(); // Reload the list
+        if (!response.ok) throw new Error(\`\${siteId ? '更新' : '添加'}网站失败\`);
+        bootstrap.Modal.getInstance(document.getElementById('siteModal')).hide();
+        await loadSiteList();
         showAlert('success', \`监控网站\${siteId ? '更新' : '添加'}成功\`, 'siteAlert');
-
     } catch (error) {
         console.error('保存网站错误:', error);
         showAlert('danger', \`保存网站失败: \${error.message}\`, 'siteAlert');
     }
 }
 
-// 显示删除网站确认模态框
 function showDeleteSiteConfirmation(siteId, siteName, siteUrl) {
     currentSiteId = siteId;
     document.getElementById('deleteSiteName').textContent = siteName;
     document.getElementById('deleteSiteUrl').textContent = siteUrl;
-    const deleteModal = new bootstrap.Modal(document.getElementById('deleteSiteModal'));
-    deleteModal.show();
+    new bootstrap.Modal(document.getElementById('deleteSiteModal')).show();
 }
 
-
-// 删除网站监控
 async function deleteSite(siteId) {
     try {
-        const response = await fetch(\`/api/admin/sites/\${siteId}\`, {
-            method: 'DELETE',
-            headers: getAuthHeaders()
-        });
-
-        if (!response.ok) {
-             const errorData = await response.json().catch(() => ({}));
-             throw new Error(errorData.message || \`删除网站失败 (\${response.status})\`);
-        }
-
-        // Hide modal and reload list
-        const deleteModal = bootstrap.Modal.getInstance(document.getElementById('deleteSiteModal'));
-        deleteModal.hide();
-        await loadSiteList(); // Reload list
+        const response = await fetch(\`/api/admin/sites/\${siteId}\`, { method: 'DELETE', headers: getAuthHeaders() });
+        if (!response.ok) throw new Error('删除网站失败');
+        bootstrap.Modal.getInstance(document.getElementById('deleteSiteModal')).hide();
+        await loadSiteList();
         showAlert('success', '网站监控已删除', 'siteAlert');
-        currentSiteId = null; // Reset current ID
-
+        currentSiteId = null;
     } catch (error) {
         console.error('删除网站错误:', error);
         showAlert('danger', \`删除网站失败: \${error.message}\`, 'siteAlert');
     }
 }
 
-
-// --- Utility Functions ---
-
-// 显示警告信息 (specify alert element ID)
 function showAlert(type, message, alertId = 'serverAlert') {
     const alertElement = document.getElementById(alertId);
-    if (!alertElement) return; // Exit if alert element doesn't exist
+    if (!alertElement) return;
     alertElement.className = \`alert alert-\${type}\`;
     alertElement.textContent = message;
     alertElement.classList.remove('d-none');
-    
-    // 5秒后自动隐藏
     setTimeout(() => {
         alertElement.classList.add('d-none');
     }, 5000);
 }
 
-// 显示密码修改警告信息 (uses its own dedicated alert element)
 function showPasswordAlert(type, message) {
     const alertElement = document.getElementById('passwordAlert');
     if (!alertElement) return;
     alertElement.className = \`alert alert-\${type}\`;
     alertElement.textContent = message;
     alertElement.classList.remove('d-none');
-    // Auto-hide not typically needed for modal alerts, but can be added if desired
 }
 
-// --- Telegram Settings Functions ---
-
-// 加载Telegram通知设置
 async function loadTelegramSettings() {
     try {
-        const response = await fetch('/api/admin/telegram-settings', {
-            headers: getAuthHeaders()
-        });
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.message || '获取Telegram设置失败');
-        }
+        const response = await fetch('/api/admin/telegram-settings', { headers: getAuthHeaders() });
+        if (!response.ok) throw new Error('获取Telegram设置失败');
         const settings = await response.json();
         if (settings) {
             document.getElementById('telegramBotToken').value = settings.bot_token || '';
@@ -4865,24 +3641,18 @@ async function loadTelegramSettings() {
     }
 }
 
-// 保存Telegram通知设置
 async function saveTelegramSettings() {
     const botToken = document.getElementById('telegramBotToken').value.trim();
     const chatId = document.getElementById('telegramChatId').value.trim();
     let enableNotifications = document.getElementById('enableTelegramNotifications').checked;
 
-    // If Bot Token or Chat ID is empty, automatically disable notifications
     if (!botToken || !chatId) {
         enableNotifications = false;
-        document.getElementById('enableTelegramNotifications').checked = false; // Update the checkbox UI
-        if (document.getElementById('enableTelegramNotifications').checked && (botToken || chatId)) { // Only show warning if user intended to enable
+        document.getElementById('enableTelegramNotifications').checked = false;
+        if (document.getElementById('enableTelegramNotifications').checked && (botToken || chatId)) {
              showAlert('warning', 'Bot Token 和 Chat ID 均不能为空才能启用通知。通知已自动禁用。', 'telegramSettingsAlert');
         }
-    } else if (enableNotifications && (!botToken || !chatId)) { // This case should ideally not be hit due to above logic, but kept for safety
-        showAlert('warning', '启用通知时，Bot Token 和 Chat ID 不能为空。', 'telegramSettingsAlert');
-        return;
     }
-
 
     try {
         const response = await fetch('/api/admin/telegram-settings', {
@@ -4891,77 +3661,52 @@ async function saveTelegramSettings() {
             body: JSON.stringify({
                 bot_token: botToken,
                 chat_id: chatId,
-                enable_notifications: enableNotifications // Use the potentially modified value
+                enable_notifications: enableNotifications
             })
         });
-
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.message || '保存Telegram设置失败');
-        }
-        
-        await response.json(); // Consume response body
+        if (!response.ok) throw new Error('保存Telegram设置失败');
         showAlert('success', 'Telegram设置已成功保存。', 'telegramSettingsAlert');
-
     } catch (error) {
         console.error('保存Telegram设置错误:', error);
-    showAlert('danger', \`保存Telegram设置失败: \${error.message}\`, 'telegramSettingsAlert');
+        showAlert('danger', \`保存Telegram设置失败: \${error.message}\`, 'telegramSettingsAlert');
     }
 }
 
-// --- Global Settings Functions (VPS Report Interval) ---
 async function loadGlobalSettings() {
     try {
-        const response = await fetch('/api/admin/settings/vps-report-interval', {
-            headers: getAuthHeaders()
-        });
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.message || '获取VPS报告间隔失败');
-        }
+        const response = await fetch('/api/admin/settings/vps-report-interval', { headers: getAuthHeaders() });
+        if (!response.ok) throw new Error('获取VPS报告间隔失败');
         const settings = await response.json();
         if (settings && typeof settings.interval === 'number') {
             document.getElementById('vpsReportInterval').value = settings.interval;
         } else {
-            document.getElementById('vpsReportInterval').value = 60; // Default if not set
+            document.getElementById('vpsReportInterval').value = 60;
         }
     } catch (error) {
         console.error('加载VPS报告间隔错误:', error);
-        showAlert('danger', \`加载VPS报告间隔失败: \${error.message}\`, 'serverAlert'); // Changed to serverAlert
-        document.getElementById('vpsReportInterval').value = 60; // Default on error
+        showAlert('danger', \`加载VPS报告间隔失败: \${error.message}\`, 'serverAlert');
+        document.getElementById('vpsReportInterval').value = 60;
     }
 }
 
 async function saveVpsReportInterval() {
     const intervalInput = document.getElementById('vpsReportInterval');
     const interval = parseInt(intervalInput.value, 10);
-
-    if (isNaN(interval) || interval < 1) { // Changed to interval < 1
-        showAlert('warning', 'VPS报告间隔必须是一个大于或等于1的数字。', 'serverAlert'); // Changed to serverAlert and message
+    if (isNaN(interval) || interval < 1) {
+        showAlert('warning', 'VPS报告间隔必须是一个大于或等于1的数字。', 'serverAlert');
         return;
     }
-    // Removed warning for interval < 10
-
     try {
         const response = await fetch('/api/admin/settings/vps-report-interval', {
             method: 'POST',
             headers: getAuthHeaders(),
             body: JSON.stringify({ interval: interval })
         });
-
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.message || '保存VPS报告间隔失败');
-        }
-        
-        await response.json(); // Consume response body
-        showAlert('success', 'VPS数据更新频率已成功保存。', 'serverAlert'); // Changed to serverAlert
-        // Optionally, reload the value to confirm, though API returns it
-        // loadGlobalSettings(); 
+        if (!response.ok) throw new Error('保存VPS报告间隔失败');
+        showAlert('success', 'VPS数据更新频率已成功保存。', 'serverAlert');
     } catch (error) {
         console.error('保存VPS报告间隔错误:', error);
-        showAlert('danger', \`保存VPS报告间隔失败: \${error.message}\`, 'serverAlert'); // Changed to serverAlert
+        showAlert('danger', \`保存VPS报告间隔失败: \${error.message}\`, 'serverAlert');
     }
-}
-`;
+}`;
 }
