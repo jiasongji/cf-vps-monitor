@@ -1,656 +1,457 @@
 #!/bin/bash
-# VPS监控脚本 - 增强版安装程序
+# =========================================================
+# Cloudflare Worker VPS Monitor - 全能管理脚本
+# 集成功能：三网丢包检测 | Uptime上报 | 服务管理 | 一键安装
+# =========================================================
 
-# 颜色定义
+# --- 基础配置 ---
+INSTALL_DIR="/opt/vps-monitor"
+SERVICE_NAME="vps-monitor"
+VERSION="2.0.0 (Ping Enhanced)"
+
+# --- 颜色定义 ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m' # 无颜色
+SKYBLUE='\033[0;36m'
+PLAIN='\033[0m'
 
-# 默认配置
-API_KEY=""
-SERVER_ID=""
-WORKER_URL=""
-INTERVAL="60" # 默认上报间隔 (秒)
-INSTALL_DIR="/opt/vps-monitor"
-SERVICE_NAME="vps-monitor"
-CONFIG_FILE="$INSTALL_DIR/config.conf"
-
-# 显示横幅
-show_banner() {
-    clear
-    echo -e "${BLUE}┌─────────────────────────────────────────────┐${NC}"
-    echo -e "${BLUE}│       ${GREEN}VPS监控系统 - 客户端管理工具${BLUE}         │${NC}"
-    echo -e "${BLUE}│                                             │${NC}"
-    echo -e "${BLUE}│  ${YELLOW}功能: 监控CPU、内存、硬盘和网络使用情况${BLUE}    │${NC}"
-    echo -e "${BLUE}│  ${YELLOW}版本: 1.1.0                            ${BLUE}   │${NC}"
-    echo -e "${BLUE}└─────────────────────────────────────────────┘${NC}"
-    echo ""
-}
-
-# 检查是否为root用户
+# --- 辅助函数 ---
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
-        echo -e "${RED}错误: 此脚本需要root权限${NC}"
+        echo -e "${RED}错误: 必须使用 root 权限运行此脚本${PLAIN}"
+        echo "请使用 sudo su 切换到 root 用户后再试"
         exit 1
     fi
 }
 
-# 加载配置
-load_config() {
-    if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
-        return 0
-    fi
-    return 1
+# --- 核心组件生成函数 ---
+
+# 1. 生成 Python 丢包检测脚本
+create_ping_daemon() {
+    cat > "$INSTALL_DIR/ping_daemon.py" << 'EOF'
+import socket
+import time
+import json
+import threading
+from collections import deque
+
+# 目标地址配置
+TARGETS = {
+    "cu": "www.cuecp.cn",
+    "ct": "www.chinaccs.cn",
+    "cm": "sx.10086.cn"
+}
+PORT = 80
+HISTORY_LEN = 100 
+INTERVAL = 2      
+OUTPUT_FILE = "/tmp/vps_monitor_ping.json"
+
+history = {
+    "cu": deque(maxlen=HISTORY_LEN),
+    "ct": deque(maxlen=HISTORY_LEN),
+    "cm": deque(maxlen=HISTORY_LEN)
 }
 
-# 保存配置
-save_config() {
-    mkdir -p "$INSTALL_DIR"
-    cat > "$CONFIG_FILE" << EOF
-# VPS监控系统配置文件
-API_KEY="$API_KEY"
-SERVER_ID="$SERVER_ID"
-WORKER_URL="$WORKER_URL"
-INTERVAL="$INTERVAL"
-INSTALL_DIR="$INSTALL_DIR"
-SERVICE_NAME="$SERVICE_NAME"
+def tcp_ping(host, port):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1.5)
+        s.connect((host, port))
+        s.close()
+        return True
+    except:
+        return False
+
+def worker(carrier, host):
+    while True:
+        result = tcp_ping(host, PORT)
+        history[carrier].append(result)
+        time.sleep(INTERVAL)
+
+def data_writer():
+    while True:
+        data = {}
+        for carrier, q in history.items():
+            if len(q) == 0:
+                data[carrier] = 0
+            else:
+                lost_count = list(q).count(False)
+                loss_rate = int((lost_count / len(q)) * 100)
+                data[carrier] = loss_rate
+        try:
+            with open(OUTPUT_FILE, 'w') as f:
+                json.dump(data, f)
+        except:
+            pass
+        time.sleep(5)
+
+for carrier, host in TARGETS.items():
+    t = threading.Thread(target=worker, args=(carrier, host))
+    t.daemon = True
+    t.start()
+
+writer = threading.Thread(target=data_writer)
+writer.daemon = True
+writer.start()
+
+while True:
+    time.sleep(60)
 EOF
-    chmod 600 "$CONFIG_FILE"
 }
 
-# 安装依赖
-install_dependencies() {
-    echo -e "${YELLOW}正在检查并安装依赖...${NC}"
-    
-    # 检测包管理器
-    if command -v apt-get &> /dev/null; then
-        PKG_MANAGER="apt-get"
-    elif command -v yum &> /dev/null; then
-        PKG_MANAGER="yum"
-    else
-        echo -e "${RED}不支持的系统，无法自动安装依赖${NC}"
-        return 1
-    fi
-    
-    # 安装依赖
-    $PKG_MANAGER update -y
-    $PKG_MANAGER install -y bc curl ifstat jq
-    
-    echo -e "${GREEN}依赖安装完成${NC}"
-    return 0
-}
-
-# 创建监控脚本
+# 2. 生成主监控脚本 (Bash)
 create_monitor_script() {
-    echo -e "${YELLOW}正在创建监控脚本...${NC}"
-    
-    cat > "$INSTALL_DIR/monitor.sh" << 'EOF'
+    local url=$1
+    local key=$2
+    local id=$3
+    local interval=$4
+
+    cat > "$INSTALL_DIR/monitor.sh" << EOF
 #!/bin/bash
+WORKDIR="$INSTALL_DIR"
+cd "\$WORKDIR" || exit 1
 
-# 配置
-API_KEY="__API_KEY__"
-SERVER_ID="__SERVER_ID__"
-WORKER_URL="__WORKER_URL__"
-INTERVAL="__INTERVAL__"  # 上报间隔（秒）
-LOG_FILE="/var/log/vps-monitor.log"
+API_KEY="$key"
+SERVER_ID="$id"
+WORKER_URL="$url"
+INTERVAL=$interval
 
-# 日志函数
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
-}
-
-# 获取CPU使用率
-get_cpu_usage() {
-    cpu_usage=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\\([0-9.]*\\)%* id.*/\\1/" | awk '{print 100 - $1}')
-    cpu_load=$(cat /proc/loadavg | awk '{print $1","$2","$3}')
-    echo "{\"usage_percent\":$cpu_usage,\"load_avg\":[$cpu_load]}"
-}
-
-# 获取内存使用情况
-get_memory_usage() {
-    total=$(free -k | grep Mem | awk '{print $2}')
-    used=$(free -k | grep Mem | awk '{print $3}')
-    free=$(free -k | grep Mem | awk '{print $4}')
-    usage_percent=$(echo "scale=1; $used * 100 / $total" | bc)
-    echo "{\"total\":$total,\"used\":$used,\"free\":$free,\"usage_percent\":$usage_percent}"
-}
-
-# 获取硬盘使用情况
-get_disk_usage() {
-    disk_info=$(df -k / | tail -1)
-    total=$(echo "$disk_info" | awk '{print $2 / 1024 / 1024}')
-    used=$(echo "$disk_info" | awk '{print $3 / 1024 / 1024}')
-    free=$(echo "$disk_info" | awk '{print $4 / 1024 / 1024}')
-    usage_percent=$(echo "$disk_info" | awk '{print $5}' | tr -d '%')
-    echo "{\"total\":$total,\"used\":$used,\"free\":$free,\"usage_percent\":$usage_percent}"
-}
-
-# 获取网络使用情况
-get_network_usage() {
-    # 检查是否安装了ifstat
-    if ! command -v ifstat &> /dev/null; then
-        log "ifstat未安装，无法获取网络速度"
-        echo "{\"upload_speed\":0,\"download_speed\":0,\"total_upload\":0,\"total_download\":0}"
-        return
+# 检查 Python 进程
+check_ping_daemon() {
+    if ! pgrep -f "ping_daemon.py" > /dev/null; then
+        nohup python3 "\$WORKDIR/ping_daemon.py" > /dev/null 2>&1 &
     fi
-    
-    # 获取网络接口
-    interface=$(ip route | grep default | awk '{print $5}')
-    
-    # 获取网络速度（KB/s）
-    network_speed=$(ifstat -i "$interface" 1 1 | tail -1)
-    download_speed=$(echo "$network_speed" | awk '{print $1 * 1024}')
-    upload_speed=$(echo "$network_speed" | awk '{print $2 * 1024}')
-    
-    # 获取总流量
-    rx_bytes=$(cat /proc/net/dev | grep "$interface" | awk '{print $2}')
-    tx_bytes=$(cat /proc/net/dev | grep "$interface" | awk '{print $10}')
-    
-    echo "{\"upload_speed\":$upload_speed,\"download_speed\":$download_speed,\"total_upload\":$tx_bytes,\"total_download\":$rx_bytes}"
 }
 
-# 获取运行时长
-get_uptime() {
-    uptime_seconds=$(cut -d. -f1 /proc/uptime)
-    echo "$uptime_seconds"
-}
-
-# 上报数据
-report_metrics() {
-    timestamp=$(date +%s)
-    cpu=$(get_cpu_usage)
-    memory=$(get_memory_usage)
-    disk=$(get_disk_usage)
-    network=$(get_network_usage)
-    uptime=$(get_uptime)
-    
-    data="{\"timestamp\":$timestamp,\"cpu\":$cpu,\"memory\":$memory,\"disk\":$disk,\"network\":$network,\"uptime\":$uptime}"
-    
-    log "正在上报数据..."
-    
-    response=$(curl -s -X POST "$WORKER_URL/api/report/$SERVER_ID" \
-        -H "Content-Type: application/json" \
-        -H "X-API-Key: $API_KEY" \
-        -d "$data")
-    
-    if [[ "$response" == *"success"* ]]; then
-        log "数据上报成功"
+# 读取 Ping 数据
+get_ping_data() {
+    if [ -f "/tmp/vps_monitor_ping.json" ]; then
+        cat "/tmp/vps_monitor_ping.json"
     else
-        log "数据上报失败: $response"
+        echo '{"cu":0,"ct":0,"cm":0}'
     fi
 }
 
-# 主函数
-main() {
-    log "VPS监控脚本启动"
-    log "服务器ID: $SERVER_ID"
-    log "Worker URL: $WORKER_URL"
-    
-    # 创建日志文件
-    touch "$LOG_FILE"
-    
-    # 主循环
-    while true; do
-        report_metrics
-        sleep $INTERVAL
-    done
+log() {
+  echo "\$(date '+%Y-%m-%d %H:%M:%S') - \$1"
 }
 
-# 启动主函数
-main
+get_uptime() {
+  cat /proc/uptime | awk '{print \$1}' | cut -d. -f1
+}
+
+get_cpu_usage() {
+  cpu_usage=\$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\\([0-9.]*\\)%* id.*/\\1/" | awk '{print 100 - \$1}')
+  cpu_load=\$(cat /proc/loadavg | awk '{print \$1", "\$2", "\$3}')
+  echo "{\"usage_percent\":\$cpu_usage,\"load_avg\":[\$cpu_load]}"
+}
+
+get_memory_usage() {
+  total=\$(free -k | grep Mem | awk '{print \$2}')
+  used=\$(free -k | grep Mem | awk '{print \$3}')
+  free=\$(free -k | grep Mem | awk '{print \$4}')
+  usage_percent=\$(echo "scale=1; \$used * 100 / \$total" | bc)
+  echo "{\"total\":\$total,\"used\":\$used,\"free\":\$free,\"usage_percent\":\$usage_percent}"
+}
+
+get_disk_usage() {
+  disk_info=\$(df -k / | tail -1)
+  total=\$(echo "\$disk_info" | awk '{print \$2 / 1024 / 1024}')
+  used=\$(echo "\$disk_info" | awk '{print \$3 / 1024 / 1024}')
+  free=\$(echo "\$disk_info" | awk '{print \$4 / 1024 / 1024}')
+  usage_percent=\$(echo "\$disk_info" | awk '{print \$5}' | tr -d '%')
+  echo "{\"total\":\$total,\"used\":\$used,\"free\":\$free,\"usage_percent\":\$usage_percent}"
+}
+
+get_network_usage() {
+  if ! command -v ifstat &> /dev/null; then
+    echo "{\"upload_speed\":0,\"download_speed\":0,\"total_upload\":0,\"total_download\":0}"
+    return
+  fi
+  
+  interface=\$(ip route | grep default | awk '{print \$5}')
+  network_speed=\$(ifstat -i "\$interface" 1 1 | tail -1)
+  download_speed=\$(echo "\$network_speed" | awk '{print \$1 * 1024}')
+  upload_speed=\$(echo "\$network_speed" | awk '{print \$2 * 1024}')
+  rx_bytes=\$(cat /proc/net/dev | grep "\$interface" | awk '{print \$2}')
+  tx_bytes=\$(cat /proc/net/dev | grep "\$interface" | awk '{print \$10}')
+  
+  echo "{\"upload_speed\":\$upload_speed,\"download_speed\":\$download_speed,\"total_upload\":\$tx_bytes,\"total_download\":\$rx_bytes}"
+}
+
+report_metrics() {
+  check_ping_daemon
+
+  timestamp=\$(date +%s)
+  cpu=\$(get_cpu_usage)
+  memory=\$(get_memory_usage)
+  disk=\$(get_disk_usage)
+  network=\$(get_network_usage)
+  ping=\$(get_ping_data)
+  uptime=\$(get_uptime)
+  
+  data="{\"timestamp\":\$timestamp,\"cpu\":\$cpu,\"memory\":\$memory,\"disk\":\$disk,\"network\":\$network,\"ping\":\$ping,\"uptime\":\$uptime}"
+  
+  response=\$(curl -s -X POST "\$WORKER_URL/api/report/\$SERVER_ID" \
+    -H "Content-Type: application/json" \
+    -H "X-API-Key: \$API_KEY" \
+    -d "\$data")
+  
+  if [[ "\$response" == *"success"* ]]; then
+    log "数据上报成功"
+  else
+    log "数据上报失败: \$response"
+  fi
+}
+
+log "监控脚本启动"
+nohup python3 "\$WORKDIR/ping_daemon.py" > /dev/null 2>&1 &
+
+while true; do
+  report_metrics
+  sleep \$INTERVAL
+done
 EOF
-
-    # 替换配置
-    sed -i "s|__API_KEY__|$API_KEY|g" "$INSTALL_DIR/monitor.sh"
-    sed -i "s|__SERVER_ID__|$SERVER_ID|g" "$INSTALL_DIR/monitor.sh"
-    sed -i "s|__WORKER_URL__|$WORKER_URL|g" "$INSTALL_DIR/monitor.sh"
-    sed -i "s|__INTERVAL__|$INTERVAL|g" "$INSTALL_DIR/monitor.sh"
-
-    # 设置执行权限
-    chmod +x "$INSTALL_DIR/monitor.sh"
-    
-    echo -e "${GREEN}监控脚本创建完成${NC}"
 }
 
-# 创建systemd服务
-create_service() {
-    echo -e "${YELLOW}正在创建系统服务...${NC}"
-    
+# 3. 生成 Systemd 服务文件
+create_service_file() {
     cat > "/etc/systemd/system/$SERVICE_NAME.service" << EOF
 [Unit]
-Description=VPS Monitor Service
+Description=VPS Monitor Service (CF Workers)
 After=network.target
 
 [Service]
+Type=simple
 ExecStart=$INSTALL_DIR/monitor.sh
+WorkingDirectory=$INSTALL_DIR
 Restart=always
+RestartSec=10
 User=root
-Group=root
-Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    systemctl daemon-reload
-    
-    echo -e "${GREEN}系统服务创建完成${NC}"
 }
 
-# 安装监控系统
-install_monitor() {
-    show_banner
-    echo -e "${CYAN}开始安装VPS监控系统...${NC}"
+# --- 功能菜单函数 ---
+
+# 1. 安装服务
+install_service() {
+    echo -e "${YELLOW}开始安装监控服务...${PLAIN}"
     
-    # 检查是否已安装
-    if systemctl is-active --quiet $SERVICE_NAME; then
-        echo -e "${YELLOW}监控系统已经安装并运行中。${NC}"
-        echo -e "${YELLOW}如需重新安装，请先卸载现有安装。${NC}"
+    # 获取参数 (如果是交互模式)
+    if [ -z "$1" ]; then
+        read -p "请输入 Worker URL (例: https://status.abc.com): " input_url
+        read -p "请输入 服务器 ID: " input_id
+        read -p "请输入 API Key: " input_key
+        read -p "请输入 上报间隔 (秒, 默认60): " input_interval
+        input_interval=${input_interval:-60}
+    else
+        input_url=$1
+        input_id=$2
+        input_key=$3
+        input_interval=$4
+    fi
+
+    # 简单校验
+    if [ -z "$input_url" ] || [ -z "$input_id" ] || [ -z "$input_key" ]; then
+        echo -e "${RED}错误: 参数不完整!${PLAIN}"
         return
     fi
     
-    # 获取配置信息
-    if [ -z "$API_KEY" ] || [ -z "$SERVER_ID" ] || [ -z "$WORKER_URL" ]; then
-        echo -e "${CYAN}请输入监控系统配置信息:${NC}"
-        
-        # 获取API密钥
-        while [ -z "$API_KEY" ]; do
-            read -p "API密钥: " API_KEY
-            if [ -z "$API_KEY" ]; then
-                echo -e "${RED}API密钥不能为空${NC}"
-            fi
-        done
-        
-        # 获取服务器ID
-        while [ -z "$SERVER_ID" ]; do
-            read -p "服务器ID: " SERVER_ID
-            if [ -z "$SERVER_ID" ]; then
-                echo -e "${RED}服务器ID不能为空${NC}"
-            fi
-        done
-        
-        # 获取Worker URL
-        while [ -z "$WORKER_URL" ]; do
-            read -p "Worker URL (例如: https://example.workers.dev): " WORKER_URL
-            if [ -z "$WORKER_URL" ]; then
-                echo -e "${RED}Worker URL不能为空${NC}"
-            fi
-        done
-        
-        # 获取上报间隔
-        local temp_interval
-        read -p "上报间隔 (秒) [默认: $INTERVAL]: " temp_interval
-        if [[ "$temp_interval" =~ ^[0-9]+$ ]] && [ "$temp_interval" -gt 0 ]; then
-            INTERVAL="$temp_interval"
-        else
-            echo -e "${YELLOW}输入无效或为空，使用默认值: $INTERVAL 秒${NC}"
-        fi
-    fi
-    
-    # 创建安装目录
+    # 清理旧环境
+    echo -e "${SKYBLUE}> 清理旧服务...${PLAIN}"
+    systemctl stop $SERVICE_NAME >/dev/null 2>&1
+    systemctl disable $SERVICE_NAME >/dev/null 2>&1
+    pkill -f "ping_daemon.py" >/dev/null 2>&1
+    rm -rf "$INSTALL_DIR"
     mkdir -p "$INSTALL_DIR"
-    
+
     # 安装依赖
-    install_dependencies || {
-        echo -e "${RED}安装依赖失败，请手动安装bc、curl和ifstat${NC}"
-        return 1
-    }
-    
-    # 创建监控脚本
-    create_monitor_script
-    
-    # 创建systemd服务
-    create_service
-    
-    # 保存配置
-    save_config
+    echo -e "${SKYBLUE}> 安装依赖组件...${PLAIN}"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y
+        apt-get install -y curl python3 ifstat bc
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y curl python3 ifstat bc
+    elif command -v apk >/dev/null 2>&1; then
+        apk add curl python3 ifstat bc coreutils
+    else
+        echo -e "${RED}无法自动安装依赖，请手动安装: curl, python3, ifstat, bc${PLAIN}"
+    fi
+
+    # 生成文件
+    echo -e "${SKYBLUE}> 写入脚本文件...${PLAIN}"
+    create_ping_daemon
+    create_monitor_script "$input_url" "$input_key" "$input_id" "$input_interval"
+    create_service_file
+
+    chmod +x "$INSTALL_DIR/monitor.sh"
     
     # 启动服务
-    echo -e "${YELLOW}正在启动监控服务...${NC}"
-    systemctl enable "$SERVICE_NAME"
-    systemctl start "$SERVICE_NAME"
-    
-    echo -e "${GREEN}VPS监控系统安装完成！${NC}"
-    echo -e "${CYAN}服务状态: $(systemctl is-active $SERVICE_NAME)${NC}"
-    echo -e "${CYAN}查看服务状态: systemctl status $SERVICE_NAME${NC}"
-    echo -e "${CYAN}查看服务日志: journalctl -u $SERVICE_NAME -f${NC}"
-    echo -e "${CYAN}或: tail -f /var/log/vps-monitor.log${NC}"
-}
-
-# 卸载监控系统
-uninstall_monitor() {
-    show_banner
-    echo -e "${CYAN}开始卸载VPS监控系统...${NC}"
-    
-    # 检查是否已安装
-    if ! systemctl is-active --quiet $SERVICE_NAME && [ ! -d "$INSTALL_DIR" ]; then
-        echo -e "${YELLOW}监控系统未安装。${NC}"
-        return
-    fi
-    
-    # 确认卸载
-    read -p "确定要卸载VPS监控系统吗？(y/n): " confirm
-    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-        echo -e "${YELLOW}卸载已取消。${NC}"
-        return
-    fi
-    
-    # 停止并禁用服务
-    echo -e "${YELLOW}正在停止监控服务...${NC}"
-    systemctl stop "$SERVICE_NAME" 2>/dev/null
-    systemctl disable "$SERVICE_NAME" 2>/dev/null
-    
-    # 删除服务文件
-    echo -e "${YELLOW}正在删除系统服务...${NC}"
-    rm -f "/etc/systemd/system/$SERVICE_NAME.service"
+    echo -e "${SKYBLUE}> 启动服务...${PLAIN}"
     systemctl daemon-reload
+    systemctl enable $SERVICE_NAME
+    systemctl start $SERVICE_NAME
     
-    # 删除安装目录
-    echo -e "${YELLOW}正在删除安装文件...${NC}"
-    rm -rf "$INSTALL_DIR"
-    
-    # 删除日志文件
-    echo -e "${YELLOW}正在删除日志文件...${NC}"
-    rm -f "/var/log/vps-monitor.log"
-
-    # 重置内存中的配置变量，以便在同一会话中重新安装时提示
-    API_KEY=""
-    SERVER_ID=""
-    WORKER_URL=""
-    INTERVAL="60" # 恢复为脚本顶部的默认值
-    
-    echo -e "${GREEN}VPS监控系统已成功卸载！${NC}"
+    echo -e "${GREEN}✅ 安装完成! 请等待约30秒以生成初始丢包数据。${PLAIN}"
 }
 
-# 查看监控状态
-check_status() {
-    show_banner
-    echo -e "${CYAN}VPS监控系统状态:${NC}"
-    
-    # 检查服务状态
-    if systemctl is-active --quiet $SERVICE_NAME; then
-        echo -e "${GREEN}● 监控服务运行中${NC}"
-    else
-        echo -e "${RED}● 监控服务未运行${NC}"
-    fi
-    
-    # 检查是否开机启动
-    if systemctl is-enabled --quiet $SERVICE_NAME; then
-        echo -e "${GREEN}● 已设置开机自启${NC}"
-    else
-        echo -e "${RED}● 未设置开机自启${NC}"
-    fi
-    
-    # 加载配置
-    if load_config; then
-        echo -e "${CYAN}配置信息:${NC}"
-        echo -e "  服务器ID: ${YELLOW}$SERVER_ID${NC}"
-        echo -e "  Worker URL: ${YELLOW}$WORKER_URL${NC}"
-        echo -e "  安装目录: ${YELLOW}$INSTALL_DIR${NC}"
-    else
-        echo -e "${RED}● 配置文件不存在${NC}"
-    fi
-    
-    # 显示系统信息
-    echo -e "${CYAN}系统信息:${NC}"
-    cpu_usage=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\\([0-9.]*\\)%* id.*/\\1/" | awk '{print 100 - $1}')
-    mem_info=$(free -m | grep Mem)
-    mem_total=$(echo "$mem_info" | awk '{print $2}')
-    mem_used=$(echo "$mem_info" | awk '{print $3}')
-    mem_usage=$(echo "scale=1; $mem_used * 100 / $mem_total" | bc)
-    disk_usage=$(df -h / | tail -1 | awk '{print $5}')
-    
-    echo -e "  CPU使用率: ${YELLOW}${cpu_usage}%${NC}"
-    echo -e "  内存使用率: ${YELLOW}${mem_usage}% (${mem_used}MB/${mem_total}MB)${NC}"
-    echo -e "  硬盘使用率: ${YELLOW}${disk_usage}${NC}"
-    
-    # 显示最近日志
-    if [ -f "/var/log/vps-monitor.log" ]; then
-        echo -e "${CYAN}最近日志:${NC}"
-        tail -n 5 "/var/log/vps-monitor.log"
-    fi
-    
-    echo ""
-    echo -e "${CYAN}服务控制命令:${NC}"
-    echo -e "  启动服务: ${YELLOW}systemctl start $SERVICE_NAME${NC}"
-    echo -e "  停止服务: ${YELLOW}systemctl stop $SERVICE_NAME${NC}"
-    echo -e "  重启服务: ${YELLOW}systemctl restart $SERVICE_NAME${NC}"
+# 2. 启动服务
+start_service() {
+    systemctl start $SERVICE_NAME
+    echo -e "${GREEN}服务已启动${PLAIN}"
 }
 
-# 停止监控服务
+# 3. 停止服务
 stop_service() {
-    show_banner
-    echo -e "${CYAN}正在停止VPS监控服务...${NC}"
-    
-    if systemctl is-active --quiet $SERVICE_NAME; then
-        systemctl stop "$SERVICE_NAME"
-        echo -e "${GREEN}服务已停止${NC}"
-    else
-        echo -e "${YELLOW}服务未运行${NC}"
-    fi
-    
-    echo -e "${CYAN}服务状态: $(systemctl is-active $SERVICE_NAME)${NC}"
+    systemctl stop $SERVICE_NAME
+    pkill -f "ping_daemon.py"
+    echo -e "${YELLOW}服务已停止 (后台 Python 进程已清理)${PLAIN}"
 }
 
-# 查看监控日志
-view_logs() {
-    show_banner
-    echo -e "${CYAN}VPS监控系统日志:${NC}"
-    
-    if [ -f "/var/log/vps-monitor.log" ]; then
-        echo -e "${YELLOW}显示最近50行日志，按Ctrl+C退出${NC}"
-        echo ""
-        tail -n 50 -f "/var/log/vps-monitor.log"
-    else
-        echo -e "${RED}日志文件不存在${NC}"
-        echo -e "${YELLOW}尝试查看系统日志:${NC}"
-        journalctl -u "$SERVICE_NAME" -n 50 --no-pager
-    fi
-}
-
-# 重启监控服务
+# 4. 重启服务
 restart_service() {
-    show_banner
-    echo -e "${CYAN}正在重启VPS监控服务...${NC}"
-    
-    if systemctl is-active --quiet $SERVICE_NAME; then
-        systemctl restart "$SERVICE_NAME"
-        echo -e "${GREEN}服务已重启${NC}"
+    systemctl stop $SERVICE_NAME
+    pkill -f "ping_daemon.py"
+    sleep 1
+    systemctl start $SERVICE_NAME
+    echo -e "${GREEN}服务已重启${PLAIN}"
+}
+
+# 5. 查看状态
+check_status() {
+    echo -e "${SKYBLUE}--- Systemd 服务状态 ---${PLAIN}"
+    systemctl status $SERVICE_NAME | grep -E "Active|loaded"
+    echo -e "${SKYBLUE}--- 后台进程状态 ---${PLAIN}"
+    if pgrep -f "ping_daemon.py" > /dev/null; then
+        echo -e "Ping守护进程: ${GREEN}运行中${PLAIN}"
     else
-        systemctl start "$SERVICE_NAME"
-        echo -e "${GREEN}服务已启动${NC}"
+        echo -e "Ping守护进程: ${RED}未运行${PLAIN}"
     fi
-    
-    echo -e "${CYAN}服务状态: $(systemctl is-active $SERVICE_NAME)${NC}"
+    echo -e "${SKYBLUE}--- 实时数据文件 ---${PLAIN}"
+    if [ -f "/tmp/vps_monitor_ping.json" ]; then
+         cat /tmp/vps_monitor_ping.json
+         echo ""
+    else
+         echo -e "${YELLOW}暂无数据文件 (服务可能刚启动)${PLAIN}"
+    fi
 }
 
-# 修改配置
-change_config() {
-    show_banner
-    echo -e "${CYAN}修改VPS监控系统配置:${NC}"
-    echo -e "${YELLOW}直接输入新值，留空则保留当前值。${NC}"
-    echo ""
-
-    # 加载现有配置
-    load_config || {
-        echo -e "${RED}错误: 无法加载配置文件 $CONFIG_FILE。请先安装。${NC}"
-        return 1
-    }
-
-    # 临时变量存储新值
-    local new_api_key=""
-    local new_server_id=""
-    local new_worker_url=""
-    local new_interval=""
-
-    # 获取新API密钥
-    read -p "新的API密钥 [当前: ${API_KEY}]: " new_api_key
-    if [ -z "$new_api_key" ]; then
-        new_api_key="$API_KEY" # 保留旧值
-    fi
-
-    # 获取新服务器ID
-    read -p "新的服务器ID [当前: ${SERVER_ID}]: " new_server_id
-    if [ -z "$new_server_id" ]; then
-        new_server_id="$SERVER_ID" # 保留旧值
-    fi
-
-    # 获取新Worker URL
-    read -p "新的Worker URL [当前: ${WORKER_URL}]: " new_worker_url
-    if [ -z "$new_worker_url" ]; then
-        new_worker_url="$WORKER_URL" # 保留旧值
-    fi
-
-    # 获取新上报间隔
-    read -p "新的上报间隔 (秒) [当前: ${INTERVAL}]: " new_interval
-    if [[ -n "$new_interval" && "$new_interval" =~ ^[0-9]+$ ]] && [ "$new_interval" -gt 0 ]; then
-        INTERVAL="$new_interval"
-    elif [ -n "$new_interval" ]; then # 如果输入了但无效
-        echo -e "${RED}无效的上报间隔输入，保留当前值: ${INTERVAL} 秒${NC}"
-    fi
-    # 如果留空，INTERVAL 保持不变
-
-    # 更新配置变量
-    API_KEY="$new_api_key"
-    SERVER_ID="$new_server_id"
-    WORKER_URL="$new_worker_url"
-    # INTERVAL 已经直接更新了
-
-    # 保存配置
-    echo -e "${YELLOW}正在保存配置...${NC}"
-    save_config
-
-    # 更新监控脚本
-    echo -e "${YELLOW}正在更新监控脚本...${NC}"
-    create_monitor_script
-
-    # 重启服务
-    echo -e "${YELLOW}正在重启服务以应用新配置...${NC}"
-    restart_service # restart_service 内部会显示状态
-
-    echo -e "${GREEN}配置已保存并重启服务。${NC}"
+# 6. 查看日志
+view_log() {
+    echo -e "${YELLOW}按 Ctrl+C 退出日志查看${PLAIN}"
+    journalctl -u $SERVICE_NAME -f
 }
 
-# 主菜单
+# 7. 配置参数 (简单版：重新安装)
+config_params() {
+    echo -e "${YELLOW}当前配置逻辑为覆盖安装，请准备好新的参数${PLAIN}"
+    install_service
+}
+
+# 8. 测试连接
+test_connection() {
+    if [ ! -f "$INSTALL_DIR/monitor.sh" ]; then
+        echo -e "${RED}未找到监控脚本，请先安装服务${PLAIN}"
+        return
+    fi
+    echo -e "${SKYBLUE}正在尝试手动执行一次上报 (不会在后台运行)...${PLAIN}"
+    # 临时执行
+    bash "$INSTALL_DIR/monitor.sh" &
+    PID=$!
+    sleep 5
+    kill $PID 2>/dev/null
+    echo -e "\n${YELLOW}测试结束，请查看上方是否有 '数据上报成功' 字样${PLAIN}"
+}
+
+# 9. 卸载服务
+uninstall_service() {
+    read -p "确定要彻底卸载监控服务吗? [y/n]: " choice
+    if [[ "$choice" == "y" ]]; then
+        systemctl stop $SERVICE_NAME
+        systemctl disable $SERVICE_NAME
+        rm -f "/etc/systemd/system/$SERVICE_NAME.service"
+        systemctl daemon-reload
+        pkill -f "ping_daemon.py"
+        rm -rf "$INSTALL_DIR"
+        echo -e "${GREEN}服务已彻底卸载${PLAIN}"
+    else
+        echo -e "操作取消"
+    fi
+}
+
+# --- 菜单界面 ---
 show_menu() {
-    while true; do
-        show_banner
-        echo -e "${CYAN}请选择操作:${NC}"
-        echo -e "  ${GREEN}1.${NC} 安装监控系统"
-        echo -e "  ${GREEN}2.${NC} 卸载监控系统"
-        echo -e "  ${GREEN}3.${NC} 查看监控状态"
-        echo -e "  ${GREEN}4.${NC} 查看监控日志"
-        echo -e "  ${GREEN}5.${NC} 停止监控服务"
-        echo -e "  ${GREEN}6.${NC} 重启监控服务"
-        echo -e "  ${GREEN}7.${NC} 修改配置"
-        echo -e "  ${GREEN}0.${NC} 退出"
-        echo ""
-        read -p "请输入选项 [0-7]: " choice
-        
-        case $choice in
-            1) install_monitor ;;
-            2) uninstall_monitor ;;
-            3) check_status ;;
-            4) view_logs ;;
-            5) stop_service ;;
-            6) restart_service ;;
-            7) change_config ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}无效的选择，请重试${NC}" ;;
-        esac
-        
-        echo ""
-        read -p "按Enter键继续..."
-    done
-}
-
-# 解析命令行参数
-parse_args() {
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            -k|--key)
-                API_KEY="$2"
-                shift 2
-                ;;
-            -s|--server)
-                SERVER_ID="$2"
-                shift 2
-                ;;
-            -u|--url)
-                WORKER_URL="$2"
-                shift 2
-                ;;
-            -d|--dir)
-                INSTALL_DIR="$2"
-                shift 2
-                ;;
-            -t|--interval)
-                if [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -gt 0 ]; then
-                    INTERVAL="$2"
-                else
-                    echo -e "${RED}错误: 无效的上报间隔 '$2'。必须是正整数。${NC}"
-                    exit 1
-                fi
-                shift 2
-                ;;
-            -i|--install)
-                DIRECT_INSTALL=1
-                shift
-                ;;
-            -h|--help)
-                show_help
-                exit 0
-                ;;
-            *)
-                echo -e "${RED}未知参数: $1${NC}"
-                show_help
-                exit 1
-                ;;
-        esac
-    done
-}
-
-# 显示帮助信息
-show_help() {
-    echo "用法: $0 [选项]"
-    echo ""
-    echo "选项:"
-    echo "  -k, --key KEY        API密钥"
-    echo "  -s, --server ID      服务器ID"
-    echo "  -u, --url URL        Worker URL"
-    echo "  -t, --interval SECS  上报间隔 (秒, 默认: 60)"
-    echo "  -d, --dir DIR        安装目录 (默认: /opt/vps-monitor)"
-    echo "  -i, --install        直接安装，不显示菜单"
-    echo "  -h, --help           显示此帮助信息"
-    echo ""
-    echo "示例:"
-    echo "  $0                   显示交互式菜单"
-    echo "  $0 -i -k API_KEY -s SERVER_ID -u https://example.workers.dev -t 300"
-    echo "                       直接安装监控系统，上报间隔为300秒"
-}
-
-# 主函数
-main() {
-    check_root
+    clear
+    echo -e "=================================="
+    echo -e "    VPS监控服务管理菜单 ${VERSION}"
+    echo -e "=================================="
+    echo -e ""
+    echo -e "${GREEN}1.${PLAIN} 安装监控服务"
+    echo -e "${GREEN}2.${PLAIN} 启动监控服务"
+    echo -e ""
+    echo -e "${GREEN}3.${PLAIN} 停止监控服务"
+    echo -e "${GREEN}4.${PLAIN} 重启监控服务"
+    echo -e ""
+    echo -e "${GREEN}5.${PLAIN} 查看服务状态"
+    echo -e "${GREEN}6.${PLAIN} 查看运行日志"
+    echo -e ""
+    echo -e "${GREEN}7.${PLAIN} 配置监控参数"
+    echo -e "${GREEN}8.${PLAIN} 测试连接"
+    echo -e ""
+    echo -e "特殊操作:"
+    echo -e "${RED}9.${PLAIN} 彻底卸载服务"
+    echo -e "${YELLOW}0.${PLAIN} 退出"
+    echo -e ""
+    read -p "请选择操作 (0-9): " choice
     
-    # 加载现有配置
-    load_config
+    case $choice in
+        1) install_service ;;
+        2) start_service ;;
+        3) stop_service ;;
+        4) restart_service ;;
+        5) check_status ;;
+        6) view_log ;;
+        7) config_params ;;
+        8) test_connection ;;
+        9) uninstall_service ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}无效输入${PLAIN}" ;;
+    esac
     
-    # 解析命令行参数
-    parse_args "$@"
-    
-    # 直接安装或显示菜单
-    if [ "$DIRECT_INSTALL" = "1" ]; then
-        install_monitor
-    else
+    if [[ "$choice" != "0" ]]; then
+        echo -e ""
+        read -p "按回车键返回主菜单..."
         show_menu
     fi
 }
 
-# 执行主函数
-main "$@"
+# --- 主逻辑入口 ---
+
+check_root
+
+# 如果带参数，进入一键安装模式 (兼容 Worker 生成的脚本)
+if [[ $# -gt 0 ]]; then
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -u|--url) ARG_URL="$2"; shift 2 ;;
+            -s|--server) ARG_ID="$2"; shift 2 ;;
+            -k|--key) ARG_KEY="$2"; shift 2 ;;
+            -i|--interval) ARG_INTERVAL="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    
+    if [ ! -z "$ARG_URL" ] && [ ! -z "$ARG_ID" ] && [ ! -z "$ARG_KEY" ]; then
+        ARG_INTERVAL=${ARG_INTERVAL:-60}
+        install_service "$ARG_URL" "$ARG_ID" "$ARG_KEY" "$ARG_INTERVAL"
+    else
+        echo -e "${RED}参数不完整，请检查 -u, -s, -k 是否都已提供${PLAIN}"
+    fi
+else
+    # 无参数，进入菜单模式
+    show_menu
+fi
