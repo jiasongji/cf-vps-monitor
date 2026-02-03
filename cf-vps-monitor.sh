@@ -38,7 +38,7 @@ from collections import deque
 
 # 目标地址配置
 TARGETS = {
-    "cu": "www.cuecp.cn",
+    "cu": "www.tynews.com.cn",
     "ct": "www.chinaccs.cn",
     "cm": "sx.10086.cn"
 }
