@@ -1,12 +1,13 @@
 #!/bin/bash
 # =========================================================
-# Cloudflare Worker VPS Monitor - 全能管理脚本 (稳定版)
+# Cloudflare Worker VPS Monitor - 全能管理脚本
+# 版本：v2.0.2 (修复间歇性上报失败/增加空值防御)
 # =========================================================
 
 # --- 基础配置 ---
 INSTALL_DIR="/opt/vps-monitor"
 SERVICE_NAME="vps-monitor"
-VERSION="2.0.1 (Stable)"
+VERSION="2.0.2 (Defensive)"
 
 # --- 颜色定义 ---
 RED='\033[0;31m'
@@ -26,7 +27,7 @@ check_root() {
 
 # --- 核心组件生成函数 ---
 
-# 1. 生成 Python 丢包检测脚本 (含原子写入优化)
+# 1. 生成 Python 丢包检测脚本 (保持原子写入)
 create_ping_daemon() {
     cat > "$INSTALL_DIR/ping_daemon.py" << 'EOF'
 import socket
@@ -103,7 +104,7 @@ while True:
 EOF
 }
 
-# 2. 生成主监控脚本 (Bash, 含 grep 修复)
+# 2. 生成主监控脚本 (Bash, 增加防御性编程)
 create_monitor_script() {
     local url=$1
     local key=$2
@@ -127,7 +128,7 @@ check_ping_daemon() {
     fi
 }
 
-# 读取 Ping 数据 (检查非空)
+# 读取 Ping 数据 (带默认值)
 get_ping_data() {
     if [ -s "/tmp/vps_monitor_ping.json" ]; then
         cat "/tmp/vps_monitor_ping.json"
@@ -141,12 +142,16 @@ log() {
 }
 
 get_uptime() {
-  cat /proc/uptime | awk '{print \$1}' | cut -d. -f1
+  # 增加容错，如果读取失败返回 0
+  cat /proc/uptime 2>/dev/null | awk '{print \$1}' | cut -d. -f1 || echo "0"
 }
 
 get_cpu_usage() {
   cpu_usage=\$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\\([0-9.]*\\)%* id.*/\\1/" | awk '{print 100 - \$1}')
   cpu_load=\$(cat /proc/loadavg | awk '{print \$1", "\$2", "\$3}')
+  # 如果为空，设置默认值
+  if [ -z "\$cpu_usage" ]; then cpu_usage=0; fi
+  if [ -z "\$cpu_load" ]; then cpu_load="0, 0, 0"; fi
   echo "{\"usage_percent\":\$cpu_usage,\"load_avg\":[\$cpu_load]}"
 }
 
@@ -154,7 +159,13 @@ get_memory_usage() {
   total=\$(free -k | grep Mem | awk '{print \$2}')
   used=\$(free -k | grep Mem | awk '{print \$3}')
   free=\$(free -k | grep Mem | awk '{print \$4}')
-  usage_percent=\$(echo "scale=1; \$used * 100 / \$total" | bc)
+  usage_percent=\$(echo "scale=1; \$used * 100 / \$total" | bc 2>/dev/null)
+  
+  if [ -z "\$total" ]; then total=0; fi
+  if [ -z "\$used" ]; then used=0; fi
+  if [ -z "\$free" ]; then free=0; fi
+  if [ -z "\$usage_percent" ]; then usage_percent=0; fi
+  
   echo "{\"total\":\$total,\"used\":\$used,\"free\":\$free,\"usage_percent\":\$usage_percent}"
 }
 
@@ -164,6 +175,12 @@ get_disk_usage() {
   used=\$(echo "\$disk_info" | awk '{print \$3 / 1024 / 1024}')
   free=\$(echo "\$disk_info" | awk '{print \$4 / 1024 / 1024}')
   usage_percent=\$(echo "\$disk_info" | awk '{print \$5}' | tr -d '%')
+  
+  if [ -z "\$total" ]; then total=0; fi
+  if [ -z "\$used" ]; then used=0; fi
+  if [ -z "\$free" ]; then free=0; fi
+  if [ -z "\$usage_percent" ]; then usage_percent=0; fi
+  
   echo "{\"total\":\$total,\"used\":\$used,\"free\":\$free,\"usage_percent\":\$usage_percent}"
 }
 
@@ -178,23 +195,40 @@ get_network_usage() {
   download_speed=\$(echo "\$network_speed" | awk '{print \$1 * 1024}')
   upload_speed=\$(echo "\$network_speed" | awk '{print \$2 * 1024}')
   
-  # 修复：head -n 1
+  # 关键修复：head -n 1
   rx_bytes=\$(cat /proc/net/dev | grep "\$interface" | head -n 1 | awk '{print \$2}')
   tx_bytes=\$(cat /proc/net/dev | grep "\$interface" | head -n 1 | awk '{print \$10}')
   
-  echo "{\"upload_speed\":\$upload_speed,\"download_speed\":\$download_speed,\"total_upload\":\$tx_bytes,\"total_download\":\$tx_bytes}"
+  # 空值防御
+  if [ -z "\$download_speed" ]; then download_speed=0; fi
+  if [ -z "\$upload_speed" ]; then upload_speed=0; fi
+  if [ -z "\$rx_bytes" ]; then rx_bytes=0; fi
+  if [ -z "\$tx_bytes" ]; then tx_bytes=0; fi
+  
+  echo "{\"upload_speed\":\$upload_speed,\"download_speed\":\$download_speed,\"total_upload\":\$tx_bytes,\"total_download\":\$rx_bytes}"
 }
 
 report_metrics() {
   check_ping_daemon
 
   timestamp=\$(date +%s)
+  
+  # 获取数据
   cpu=\$(get_cpu_usage)
   memory=\$(get_memory_usage)
   disk=\$(get_disk_usage)
   network=\$(get_network_usage)
   ping=\$(get_ping_data)
   uptime=\$(get_uptime)
+  
+  # --- 终极防御：如果以上任何函数返回空字符串，这里进行兜底 ---
+  # 防止 JSON 语法错误 (例如 "uptime": } )
+  cpu=\${cpu:-'{"usage_percent":0,"load_avg":[0,0,0]}'}
+  memory=\${memory:-'{"total":0,"used":0,"free":0,"usage_percent":0}'}
+  disk=\${disk:-'{"total":0,"used":0,"free":0,"usage_percent":0}'}
+  network=\${network:-'{"upload_speed":0,"download_speed":0,"total_upload":0,"total_download":0}'}
+  ping=\${ping:-'{"cu":0,"ct":0,"cm":0}'}
+  uptime=\${uptime:-0}
   
   data="{\"timestamp\":\$timestamp,\"cpu\":\$cpu,\"memory\":\$memory,\"disk\":\$disk,\"network\":\$network,\"ping\":\$ping,\"uptime\":\$uptime}"
   
@@ -210,13 +244,31 @@ report_metrics() {
   fi
 }
 
-log "监控脚本启动"
-nohup python3 "\$WORKDIR/ping_daemon.py" > /dev/null 2>&1 &
+install_dependencies() {
+  log "检查并安装依赖..."
+  if command -v apt-get &> /dev/null; then
+    PKG_MANAGER="apt-get"
+  elif command -v yum &> /dev/null; then
+    PKG_MANAGER="yum"
+  else
+    return 1
+  fi
+  $PKG_MANAGER update -y
+  $PKG_MANAGER install -y bc curl ifstat python3
+  return 0
+}
 
-while true; do
-  report_metrics
-  sleep \$INTERVAL
-done
+main() {
+  log "VPS监控脚本启动 (Defensive Mode)"
+  install_dependencies
+  nohup python3 "\$WORKDIR/ping_daemon.py" > /dev/null 2>&1 &
+  while true; do
+    report_metrics
+    sleep \$INTERVAL
+  done
+}
+
+main
 EOF
 }
 
@@ -446,7 +498,7 @@ if [[ $# -gt 0 ]]; then
         ARG_INTERVAL=${ARG_INTERVAL:-60}
         install_service "$ARG_URL" "$ARG_ID" "$ARG_KEY" "$ARG_INTERVAL"
     else
-        echo -e "${RED}参数不完整，请检查 -u, -s, -k 是否都已提供${PLAIN}"
+        show_menu
     fi
 else
     show_menu
