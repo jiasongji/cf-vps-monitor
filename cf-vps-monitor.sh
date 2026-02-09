@@ -1,13 +1,12 @@
 #!/bin/bash
 # =========================================================
-# Cloudflare Worker VPS Monitor - 全能管理脚本
-# 集成功能：三网丢包检测 | Uptime上报 | 服务管理 | 一键安装
+# Cloudflare Worker VPS Monitor - 全能管理脚本 (稳定版)
 # =========================================================
 
 # --- 基础配置 ---
 INSTALL_DIR="/opt/vps-monitor"
 SERVICE_NAME="vps-monitor"
-VERSION="2.0.0 (Ping Enhanced)"
+VERSION="2.0.1 (Stable)"
 
 # --- 颜色定义 ---
 RED='\033[0;31m'
@@ -27,18 +26,19 @@ check_root() {
 
 # --- 核心组件生成函数 ---
 
-# 1. 生成 Python 丢包检测脚本
+# 1. 生成 Python 丢包检测脚本 (含原子写入优化)
 create_ping_daemon() {
     cat > "$INSTALL_DIR/ping_daemon.py" << 'EOF'
 import socket
 import time
 import json
 import threading
+import os
 from collections import deque
 
 # 目标地址配置
 TARGETS = {
-    "cu": "www.tynews.com.cn",
+    "cu": "www.cuecp.cn",
     "ct": "www.chinaccs.cn",
     "cm": "sx.10086.cn"
 }
@@ -46,6 +46,7 @@ PORT = 80
 HISTORY_LEN = 100 
 INTERVAL = 2      
 OUTPUT_FILE = "/tmp/vps_monitor_ping.json"
+TEMP_FILE = OUTPUT_FILE + ".tmp"
 
 history = {
     "cu": deque(maxlen=HISTORY_LEN),
@@ -80,8 +81,10 @@ def data_writer():
                 loss_rate = int((lost_count / len(q)) * 100)
                 data[carrier] = loss_rate
         try:
-            with open(OUTPUT_FILE, 'w') as f:
+            # 原子写入
+            with open(TEMP_FILE, 'w') as f:
                 json.dump(data, f)
+            os.replace(TEMP_FILE, OUTPUT_FILE)
         except:
             pass
         time.sleep(5)
@@ -100,7 +103,7 @@ while True:
 EOF
 }
 
-# 2. 生成主监控脚本 (Bash)
+# 2. 生成主监控脚本 (Bash, 含 grep 修复)
 create_monitor_script() {
     local url=$1
     local key=$2
@@ -124,9 +127,9 @@ check_ping_daemon() {
     fi
 }
 
-# 读取 Ping 数据
+# 读取 Ping 数据 (检查非空)
 get_ping_data() {
-    if [ -f "/tmp/vps_monitor_ping.json" ]; then
+    if [ -s "/tmp/vps_monitor_ping.json" ]; then
         cat "/tmp/vps_monitor_ping.json"
     else
         echo '{"cu":0,"ct":0,"cm":0}'
@@ -174,10 +177,12 @@ get_network_usage() {
   network_speed=\$(ifstat -i "\$interface" 1 1 | tail -1)
   download_speed=\$(echo "\$network_speed" | awk '{print \$1 * 1024}')
   upload_speed=\$(echo "\$network_speed" | awk '{print \$2 * 1024}')
-  rx_bytes=\$(cat /proc/net/dev | grep "\$interface" | awk '{print \$2}')
-  tx_bytes=\$(cat /proc/net/dev | grep "\$interface" | awk '{print \$10}')
   
-  echo "{\"upload_speed\":\$upload_speed,\"download_speed\":\$download_speed,\"total_upload\":\$tx_bytes,\"total_download\":\$rx_bytes}"
+  # 修复：head -n 1
+  rx_bytes=\$(cat /proc/net/dev | grep "\$interface" | head -n 1 | awk '{print \$2}')
+  tx_bytes=\$(cat /proc/net/dev | grep "\$interface" | head -n 1 | awk '{print \$10}')
+  
+  echo "{\"upload_speed\":\$upload_speed,\"download_speed\":\$download_speed,\"total_upload\":\$tx_bytes,\"total_download\":\$tx_bytes}"
 }
 
 report_metrics() {
@@ -241,7 +246,6 @@ EOF
 install_service() {
     echo -e "${YELLOW}开始安装监控服务...${PLAIN}"
     
-    # 获取参数 (如果是交互模式)
     if [ -z "$1" ]; then
         read -p "请输入 Worker URL (例: https://status.abc.com): " input_url
         read -p "请输入 服务器 ID: " input_id
@@ -255,13 +259,11 @@ install_service() {
         input_interval=$4
     fi
 
-    # 简单校验
     if [ -z "$input_url" ] || [ -z "$input_id" ] || [ -z "$input_key" ]; then
         echo -e "${RED}错误: 参数不完整!${PLAIN}"
         return
     fi
     
-    # 清理旧环境
     echo -e "${SKYBLUE}> 清理旧服务...${PLAIN}"
     systemctl stop $SERVICE_NAME >/dev/null 2>&1
     systemctl disable $SERVICE_NAME >/dev/null 2>&1
@@ -269,7 +271,6 @@ install_service() {
     rm -rf "$INSTALL_DIR"
     mkdir -p "$INSTALL_DIR"
 
-    # 安装依赖
     echo -e "${SKYBLUE}> 安装依赖组件...${PLAIN}"
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -y
@@ -282,7 +283,6 @@ install_service() {
         echo -e "${RED}无法自动安装依赖，请手动安装: curl, python3, ifstat, bc${PLAIN}"
     fi
 
-    # 生成文件
     echo -e "${SKYBLUE}> 写入脚本文件...${PLAIN}"
     create_ping_daemon
     create_monitor_script "$input_url" "$input_key" "$input_id" "$input_interval"
@@ -290,7 +290,6 @@ install_service() {
 
     chmod +x "$INSTALL_DIR/monitor.sh"
     
-    # 启动服务
     echo -e "${SKYBLUE}> 启动服务...${PLAIN}"
     systemctl daemon-reload
     systemctl enable $SERVICE_NAME
@@ -332,7 +331,7 @@ check_status() {
         echo -e "Ping守护进程: ${RED}未运行${PLAIN}"
     fi
     echo -e "${SKYBLUE}--- 实时数据文件 ---${PLAIN}"
-    if [ -f "/tmp/vps_monitor_ping.json" ]; then
+    if [ -s "/tmp/vps_monitor_ping.json" ]; then
          cat /tmp/vps_monitor_ping.json
          echo ""
     else
@@ -346,7 +345,7 @@ view_log() {
     journalctl -u $SERVICE_NAME -f
 }
 
-# 7. 配置参数 (简单版：重新安装)
+# 7. 配置参数
 config_params() {
     echo -e "${YELLOW}当前配置逻辑为覆盖安装，请准备好新的参数${PLAIN}"
     install_service
@@ -359,7 +358,6 @@ test_connection() {
         return
     fi
     echo -e "${SKYBLUE}正在尝试手动执行一次上报 (不会在后台运行)...${PLAIN}"
-    # 临时执行
     bash "$INSTALL_DIR/monitor.sh" &
     PID=$!
     sleep 5
@@ -433,7 +431,6 @@ show_menu() {
 
 check_root
 
-# 如果带参数，进入一键安装模式 (兼容 Worker 生成的脚本)
 if [[ $# -gt 0 ]]; then
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -452,6 +449,5 @@ if [[ $# -gt 0 ]]; then
         echo -e "${RED}参数不完整，请检查 -u, -s, -k 是否都已提供${PLAIN}"
     fi
 else
-    # 无参数，进入菜单模式
     show_menu
 fi
