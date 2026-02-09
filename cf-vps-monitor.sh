@@ -1,13 +1,17 @@
 #!/bin/bash
 # =========================================================
 # Cloudflare Worker VPS Monitor - 全能管理脚本
-# 版本：v2.0.4 (Paranoid Mode - 强力去换行 + 故障现场记录)
+# 版本：v2.0.5 (Locale Fix + Process Cleanup)
 # =========================================================
 
 # --- 基础配置 ---
 INSTALL_DIR="/opt/vps-monitor"
 SERVICE_NAME="vps-monitor"
-VERSION="2.0.4 (Paranoid)"
+VERSION="2.0.5 (Locale Fix)"
+
+# --- 关键修复：强制使用标准英语环境 ---
+# 防止 top/free 等命令因系统语言不同导致输出格式混乱
+export LC_ALL=C
 
 # --- 颜色定义 ---
 RED='\033[0;31m'
@@ -35,6 +39,8 @@ import time
 import json
 import threading
 import os
+import signal
+import sys
 from collections import deque
 
 # 目标地址配置
@@ -54,6 +60,12 @@ history = {
     "ct": deque(maxlen=HISTORY_LEN),
     "cm": deque(maxlen=HISTORY_LEN)
 }
+
+# 优雅退出处理
+def signal_handler(sig, frame):
+    sys.exit(0)
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
 
 def tcp_ping(host, port):
     try:
@@ -103,7 +115,7 @@ while True:
 EOF
 }
 
-# 2. 生成主监控脚本 (Bash, 极度偏执模式)
+# 2. 生成主监控脚本 (Bash, Locale Fixed)
 create_monitor_script() {
     local url=$1
     local key=$2
@@ -114,6 +126,10 @@ create_monitor_script() {
 #!/bin/bash
 WORKDIR="$INSTALL_DIR"
 cd "\$WORKDIR" || exit 1
+
+# 强制环境变量，防止 awk/grep 行为异常
+export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 API_KEY="$key"
 SERVER_ID="$id"
@@ -131,14 +147,12 @@ log() {
   echo "\$(date '+%Y-%m-%d %H:%M:%S') - \$1"
 }
 
-# --- 数据采集函数 (Paranoid Mode) ---
-# 所有输出通过 tr -d '\n\r' 清洗，防止 JSON 断行
+# --- 数据采集函数 ---
 
 get_ping_data() {
     local default='{"cu":0,"ct":0,"cm":0}'
     if [ -s "/tmp/vps_monitor_ping.json" ]; then
         local content=\$(cat "/tmp/vps_monitor_ping.json")
-        # 简单校验
         if [[ "\$content" == \{*\} ]]; then
             echo "\$content" | tr -d '\n\r'
             return
@@ -149,11 +163,7 @@ get_ping_data() {
 
 get_uptime() {
     local up=\$(cat /proc/uptime 2>/dev/null | awk '{print \$1}' | cut -d. -f1)
-    if [[ ! "\$up" =~ ^[0-9]+$ ]]; then
-        echo "0"
-    else
-        echo "\$up" | tr -d '\n\r'
-    fi
+    if [[ ! "\$up" =~ ^[0-9]+$ ]]; then echo "0"; else echo "\$up" | tr -d '\n\r'; fi
 }
 
 get_cpu_usage() {
@@ -163,11 +173,10 @@ get_cpu_usage() {
     cpu_usage=\${cpu_usage:-0}
     cpu_load=\${cpu_load:-"0, 0, 0"}
     
-    # 组装前清洗
-    cpu_usage=\$(echo "\$cpu_usage" | tr -d '\n\r')
-    cpu_load=\$(echo "\$cpu_load" | tr -d '\n\r')
-    
-    echo "{\"usage_percent\":\$cpu_usage,\"load_avg\":[\$cpu_load]}"
+    # 二次清洗：确保是数字
+    # if [[ ! "\$cpu_usage" =~ ^[0-9.]+$ ]]; then cpu_usage=0; fi
+
+    echo "{\"usage_percent\":\$cpu_usage,\"load_avg\":[\$cpu_load]}" | tr -d '\n\r'
 }
 
 get_memory_usage() {
@@ -186,13 +195,7 @@ get_memory_usage() {
     fi
     usage_percent=\${usage_percent:-0}
     
-    # 清洗
-    total=\$(echo "\$total" | tr -d '\n\r')
-    used=\$(echo "\$used" | tr -d '\n\r')
-    free=\$(echo "\$free" | tr -d '\n\r')
-    usage_percent=\$(echo "\$usage_percent" | tr -d '\n\r')
-    
-    echo "{\"total\":\$total,\"used\":\$used,\"free\":\$free,\"usage_percent\":\$usage_percent}"
+    echo "{\"total\":\$total,\"used\":\$used,\"free\":\$free,\"usage_percent\":\$usage_percent}" | tr -d '\n\r'
 }
 
 get_disk_usage() {
@@ -207,13 +210,7 @@ get_disk_usage() {
     free=\${free:-0}
     usage_percent=\${usage_percent:-0}
     
-    # 清洗
-    total=\$(echo "\$total" | tr -d '\n\r')
-    used=\$(echo "\$used" | tr -d '\n\r')
-    free=\$(echo "\$free" | tr -d '\n\r')
-    usage_percent=\$(echo "\$usage_percent" | tr -d '\n\r')
-
-    echo "{\"total\":\$total,\"used\":\$used,\"free\":\$free,\"usage_percent\":\$usage_percent}"
+    echo "{\"total\":\$total,\"used\":\$used,\"free\":\$free,\"usage_percent\":\$usage_percent}" | tr -d '\n\r'
 }
 
 get_network_usage() {
@@ -236,13 +233,7 @@ get_network_usage() {
     rx=\${rx:-0}
     tx=\${tx:-0}
     
-    # 清洗
-    download=\$(echo "\$download" | tr -d '\n\r')
-    upload=\$(echo "\$upload" | tr -d '\n\r')
-    rx=\$(echo "\$rx" | tr -d '\n\r')
-    tx=\$(echo "\$tx" | tr -d '\n\r')
-    
-    echo "{\"upload_speed\":\$upload,\"download_speed\":\$download,\"total_upload\":\$tx,\"total_download\":\$rx}"
+    echo "{\"upload_speed\":\$upload,\"download_speed\":\$download,\"total_upload\":\$tx,\"total_download\":\$rx}" | tr -d '\n\r'
 }
 
 report_metrics() {
@@ -266,7 +257,7 @@ report_metrics() {
   if [ -z "\$ping" ]; then ping='{"cu":0,"ct":0,"cm":0}'; fi
   if [ -z "\$uptime" ]; then uptime=0; fi
   
-  # 组装 JSON
+  # 组装 JSON (手动拼接)
   data="{\"timestamp\":\$timestamp,\"cpu\":\$cpu,\"memory\":\$memory,\"disk\":\$disk,\"network\":\$network,\"ping\":\$ping,\"uptime\":\$uptime}"
   
   response=\$(curl -s -X POST "\$WORKER_URL/api/report/\$SERVER_ID" \
@@ -277,7 +268,6 @@ report_metrics() {
   if [[ "\$response" == *"success"* ]]; then
     log "数据上报成功"
   else
-    # 关键：故障现场记录！
     log "数据上报失败: \$response"
     log "【调试】失败时的 JSON 数据: \$data"
   fi
@@ -286,16 +276,14 @@ report_metrics() {
 install_dependencies() {
   log "检查并安装依赖..."
   local pkg_manager=""
-  
   if command -v apt-get &> /dev/null; then
     pkg_manager="apt-get"
   elif command -v yum &> /dev/null; then
     pkg_manager="yum"
   else
-    log "警告：未找到 apt-get 或 yum，尝试直接运行。如果失败请手动安装依赖。"
+    log "警告：未找到 apt-get 或 yum，尝试直接运行。"
     return 1
   fi
-  
   if [ ! -z "\$pkg_manager" ]; then
       \$pkg_manager update -y 2>/dev/null
       \$pkg_manager install -y bc curl ifstat python3
@@ -304,7 +292,7 @@ install_dependencies() {
 }
 
 main() {
-  log "VPS监控脚本启动 (Paranoid Mode)"
+  log "VPS监控脚本启动 (Locale Fix)"
   install_dependencies
   nohup python3 "\$WORKDIR/ping_daemon.py" > /dev/null 2>&1 &
   while true; do
@@ -331,6 +319,9 @@ WorkingDirectory=$INSTALL_DIR
 Restart=always
 RestartSec=10
 User=root
+# 关键：在 Systemd 层面也强制语言环境
+Environment=LC_ALL=C
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 [Install]
 WantedBy=multi-user.target
@@ -361,11 +352,15 @@ install_service() {
         return
     fi
     
-    echo -e "${SKYBLUE}> 清理旧服务...${PLAIN}"
+    echo -e "${SKYBLUE}> 强力清理旧环境...${PLAIN}"
     systemctl stop $SERVICE_NAME >/dev/null 2>&1
     systemctl disable $SERVICE_NAME >/dev/null 2>&1
+    # 双重查杀，防止僵尸进程
+    killall -9 monitor.sh >/dev/null 2>&1
+    killall -9 ping_daemon.py >/dev/null 2>&1
     pkill -f "ping_daemon.py" >/dev/null 2>&1
     rm -rf "$INSTALL_DIR"
+    rm -f "/tmp/vps_monitor_ping.json"
     mkdir -p "$INSTALL_DIR"
 
     echo -e "${SKYBLUE}> 安装依赖组件...${PLAIN}"
@@ -376,8 +371,6 @@ install_service() {
         yum install -y curl python3 ifstat bc
     elif command -v apk >/dev/null 2>&1; then
         apk add curl python3 ifstat bc coreutils
-    else
-        echo -e "${RED}无法自动安装依赖，请手动安装: curl, python3, ifstat, bc${PLAIN}"
     fi
 
     echo -e "${SKYBLUE}> 写入脚本文件...${PLAIN}"
@@ -412,7 +405,7 @@ stop_service() {
 restart_service() {
     systemctl stop $SERVICE_NAME
     pkill -f "ping_daemon.py"
-    sleep 1
+    sleep 2
     systemctl start $SERVICE_NAME
     echo -e "${GREEN}服务已重启${PLAIN}"
 }
@@ -470,8 +463,10 @@ uninstall_service() {
         systemctl disable $SERVICE_NAME
         rm -f "/etc/systemd/system/$SERVICE_NAME.service"
         systemctl daemon-reload
-        pkill -f "ping_daemon.py"
+        killall -9 monitor.sh >/dev/null 2>&1
+        killall -9 ping_daemon.py >/dev/null 2>&1
         rm -rf "$INSTALL_DIR"
+        rm -f "/tmp/vps_monitor_ping.json"
         echo -e "${GREEN}服务已彻底卸载${PLAIN}"
     else
         echo -e "操作取消"
