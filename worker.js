@@ -1354,8 +1354,6 @@ function isValidHttpUrl(string) {
 // --- Original Handlers (Install Script, Frontend) ---
 
 // 处理安装脚本
-// 处理安装脚本
-// 处理安装脚本
 async function handleInstallScript(request, url, env) {
   const baseUrl = url.origin;
   let vpsReportInterval = '60';
@@ -1377,6 +1375,7 @@ async function handleInstallScript(request, url, env) {
     console.error("Error fetching VPS report interval for install script:", e);
   }
   
+  // 修正后的脚本模板
   const script = `#!/bin/bash
 # VPS监控脚本 - 安装程序
 
@@ -1390,26 +1389,11 @@ SERVICE_NAME="vps-monitor"
 # 解析参数
 while [[ $# -gt 0 ]]; do
   case $1 in
-    -k|--key)
-      API_KEY="$2"
-      shift 2
-      ;;
-    -s|--server)
-      SERVER_ID="$2"
-      shift 2
-      ;;
-    -u|--url)
-      WORKER_URL="$2"
-      shift 2
-      ;;
-    -d|--dir)
-      INSTALL_DIR="$2"
-      shift 2
-      ;;
-    *)
-      echo "未知参数: $1"
-      exit 1
-      ;;
+    -k|--key) API_KEY="$2"; shift 2 ;;
+    -s|--server) SERVER_ID="$2"; shift 2 ;;
+    -u|--url) WORKER_URL="$2"; shift 2 ;;
+    -d|--dir) INSTALL_DIR="$2"; shift 2 ;;
+    *) echo "未知参数: $1"; exit 1 ;;
   esac
 done
 
@@ -1437,26 +1421,28 @@ cd "$INSTALL_DIR" || exit 1
 # ==========================================
 # 1. 创建 Python TCPing 守护进程脚本
 # ==========================================
+# 优化：引入 os 模块，使用原子写入防止读取到半截文件
 cat > "$INSTALL_DIR/ping_daemon.py" << 'PYTHONEOF'
 import socket
 import time
 import json
 import threading
-import sys
+import os
 from collections import deque
 
 # 配置目标
 TARGETS = {
-    "cu": "www.tynews.com.cn",
+    "cu": "www.cuecp.cn",
     "ct": "www.chinaccs.cn",
     "cm": "sx.10086.cn"
 }
 PORT = 80
 HISTORY_LEN = 100
-INTERVAL = 2  # 每次Ping的间隔(秒)
+INTERVAL = 2  
 OUTPUT_FILE = "/tmp/vps_monitor_ping.json"
+TEMP_FILE = OUTPUT_FILE + ".tmp"
 
-# 存储历史记录 (True=通, False=丢)
+# 存储历史记录
 history = {
     "cu": deque(maxlen=HISTORY_LEN),
     "ct": deque(maxlen=HISTORY_LEN),
@@ -1467,7 +1453,6 @@ def tcp_ping(host, port):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(1.5)
-        start = time.time()
         s.connect((host, port))
         s.close()
         return True
@@ -1487,14 +1472,15 @@ def data_writer():
             if len(q) == 0:
                 data[carrier] = 0
             else:
-                # 计算丢包率 (失败次数 / 总次数 * 100)
                 lost_count = list(q).count(False)
                 loss_rate = int((lost_count / len(q)) * 100)
                 data[carrier] = loss_rate
         
         try:
-            with open(OUTPUT_FILE, 'w') as f:
+            # 原子写入：先写临时文件，再重命名，防止竞争条件
+            with open(TEMP_FILE, 'w') as f:
                 json.dump(data, f)
+            os.replace(TEMP_FILE, OUTPUT_FILE)
         except:
             pass
         time.sleep(5)
@@ -1505,12 +1491,10 @@ for carrier, host in TARGETS.items():
     t.daemon = True
     t.start()
 
-# 启动写入线程
 writer = threading.Thread(target=data_writer)
 writer.daemon = True
 writer.start()
 
-# 保持主线程运行
 while True:
     time.sleep(60)
 PYTHONEOF
@@ -1521,7 +1505,7 @@ PYTHONEOF
 cat > "$INSTALL_DIR/monitor.sh" << 'EOF'
 #!/bin/bash
 
-# 获取脚本所在目录，防止 Systemd 启动时路径错误
+# 获取脚本所在目录
 WORKDIR=$(dirname "$(readlink -f "$0")")
 cd "$WORKDIR" || exit 1
 
@@ -1538,33 +1522,29 @@ check_ping_daemon() {
     fi
 }
 
-# 读取 Ping 数据
+# 读取 Ping 数据 (修复：使用 -s 检查文件是否非空)
 get_ping_data() {
-    if [ -f "/tmp/vps_monitor_ping.json" ]; then
+    if [ -s "/tmp/vps_monitor_ping.json" ]; then
         cat "/tmp/vps_monitor_ping.json"
     else
         echo '{"cu":0,"ct":0,"cm":0}'
     fi
 }
 
-# 日志函数
 log() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
 }
 
-# 获取正常运行时间 (uptime)
 get_uptime() {
   cat /proc/uptime | awk '{print $1}' | cut -d. -f1
 }
 
-# 获取CPU使用率 (注意引号转义)
 get_cpu_usage() {
   cpu_usage=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\\([0-9.]*\\)%* id.*/\\1/" | awk '{print 100 - $1}')
   cpu_load=$(cat /proc/loadavg | awk '{print $1","$2","$3}')
   echo "{\\"usage_percent\\":$cpu_usage,\\"load_avg\\":[$cpu_load]}"
 }
 
-# 获取内存使用情况
 get_memory_usage() {
   total=$(free -k | grep Mem | awk '{print $2}')
   used=$(free -k | grep Mem | awk '{print $3}')
@@ -1573,7 +1553,6 @@ get_memory_usage() {
   echo "{\\"total\\":$total,\\"used\\":$used,\\"free\\":$free,\\"usage_percent\\":$usage_percent}"
 }
 
-# 获取硬盘使用情况
 get_disk_usage() {
   disk_info=$(df -k / | tail -1)
   total=$(echo "$disk_info" | awk '{print $2 / 1024 / 1024}')
@@ -1583,33 +1562,27 @@ get_disk_usage() {
   echo "{\\"total\\":$total,\\"used\\":$used,\\"free\\":$free,\\"usage_percent\\":$usage_percent}"
 }
 
-# 获取网络使用情况
+# 修复：增加 head -n 1 防止匹配多行网卡数据
 get_network_usage() {
-  # 检查是否安装了ifstat
   if ! command -v ifstat &> /dev/null; then
-    log "ifstat未安装，无法获取网络速度"
     echo "{\\"upload_speed\\":0,\\"download_speed\\":0,\\"total_upload\\":0,\\"total_download\\":0}"
     return
   fi
   
-  # 获取网络接口
   interface=$(ip route | grep default | awk '{print $5}')
   
-  # 获取网络速度（KB/s）
   network_speed=$(ifstat -i "$interface" 1 1 | tail -1)
   download_speed=$(echo "$network_speed" | awk '{print $1 * 1024}')
   upload_speed=$(echo "$network_speed" | awk '{print $2 * 1024}')
   
-  # 获取总流量
-  rx_bytes=$(cat /proc/net/dev | grep "$interface" | awk '{print $2}')
-  tx_bytes=$(cat /proc/net/dev | grep "$interface" | awk '{print $10}')
+  # 关键修复：head -n 1
+  rx_bytes=$(cat /proc/net/dev | grep "$interface" | head -n 1 | awk '{print $2}')
+  tx_bytes=$(cat /proc/net/dev | grep "$interface" | head -n 1 | awk '{print $10}')
   
   echo "{\\"upload_speed\\":$upload_speed,\\"download_speed\\":$download_speed,\\"total_upload\\":$tx_bytes,\\"total_download\\":$rx_bytes}"
 }
 
-# 上报数据
 report_metrics() {
-  # 检查守护进程
   check_ping_daemon
 
   timestamp=$(date +%s)
@@ -1620,10 +1593,7 @@ report_metrics() {
   ping=$(get_ping_data)
   uptime=$(get_uptime)
   
-  # 组装 JSON (关键：加入了 uptime，并保持双重转义 \\")
   data="{\\"timestamp\\":$timestamp,\\"cpu\\":$cpu,\\"memory\\":$memory,\\"disk\\":$disk,\\"network\\":$network,\\"ping\\":$ping,\\"uptime\\":$uptime}"
-  
-  # log "上报数据: $data"
   
   response=$(curl -s -X POST "$WORKER_URL/api/report/$SERVER_ID" \
     -H "Content-Type: application/json" \
@@ -1637,46 +1607,30 @@ report_metrics() {
   fi
 }
 
-# 安装依赖
 install_dependencies() {
   log "检查并安装依赖..."
-  
-  # 检测包管理器
   if command -v apt-get &> /dev/null; then
     PKG_MANAGER="apt-get"
   elif command -v yum &> /dev/null; then
     PKG_MANAGER="yum"
   else
-    log "不支持的系统，无法自动安装依赖"
     return 1
   fi
-  
-  # 安装依赖 (增加 python3)
   $PKG_MANAGER update -y
   $PKG_MANAGER install -y bc curl ifstat python3
-  
-  log "依赖安装完成"
   return 0
 }
 
-# 主函数
 main() {
   log "VPS监控脚本启动"
-  
-  # 安装依赖
   install_dependencies
-  
-  # 启动 Python 守护进程
   nohup python3 "$WORKDIR/ping_daemon.py" > /dev/null 2>&1 &
-  
-  # 主循环
   while true; do
     report_metrics
     sleep $INTERVAL
   done
 }
 
-# 启动主函数
 main
 EOF
 
@@ -1685,12 +1639,9 @@ sed -i "s|__API_KEY__|$API_KEY|g" "$INSTALL_DIR/monitor.sh"
 sed -i "s|__SERVER_ID__|$SERVER_ID|g" "$INSTALL_DIR/monitor.sh"
 sed -i "s|__WORKER_URL__|$WORKER_URL|g" "$INSTALL_DIR/monitor.sh"
 sed -i "s|^INTERVAL=.*|INTERVAL=${vpsReportInterval}|g" "$INSTALL_DIR/monitor.sh"
-sed -i "s|__INSTALL_DIR__|$INSTALL_DIR|g" "$INSTALL_DIR/monitor.sh"
 
-# 设置执行权限
 chmod +x "$INSTALL_DIR/monitor.sh"
 
-# 创建systemd服务
 cat > "/etc/systemd/system/$SERVICE_NAME.service" << EOF
 [Unit]
 Description=VPS Monitor Service
@@ -1707,7 +1658,6 @@ Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 WantedBy=multi-user.target
 EOF
 
-# 启动服务
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 systemctl start "$SERVICE_NAME"
@@ -1717,6 +1667,7 @@ echo "服务已启动并设置为开机自启"
 echo "查看服务状态: systemctl status $SERVICE_NAME"
 echo "查看服务日志: journalctl -u $SERVICE_NAME -f"
 `;
+
   return new Response(script, {
     headers: {
       'Content-Type': 'text/plain',
