@@ -1,13 +1,13 @@
 #!/bin/bash
 # =========================================================
 # Cloudflare Worker VPS Monitor - 全能管理脚本
-# 版本：v2.0.3 (Strict Mode - 强制数据清洗)
+# 版本：v2.0.4 (Paranoid Mode - 强力去换行 + 故障现场记录)
 # =========================================================
 
 # --- 基础配置 ---
 INSTALL_DIR="/opt/vps-monitor"
 SERVICE_NAME="vps-monitor"
-VERSION="2.0.3 (Strict)"
+VERSION="2.0.4 (Paranoid)"
 
 # --- 颜色定义 ---
 RED='\033[0;31m'
@@ -27,7 +27,7 @@ check_root() {
 
 # --- 核心组件生成函数 ---
 
-# 1. 生成 Python 丢包检测脚本 (保持原子写入)
+# 1. 生成 Python 丢包检测脚本 (原子写入)
 create_ping_daemon() {
     cat > "$INSTALL_DIR/ping_daemon.py" << 'EOF'
 import socket
@@ -82,7 +82,6 @@ def data_writer():
                 loss_rate = int((lost_count / len(q)) * 100)
                 data[carrier] = loss_rate
         try:
-            # 原子写入
             with open(TEMP_FILE, 'w') as f:
                 json.dump(data, f)
             os.replace(TEMP_FILE, OUTPUT_FILE)
@@ -104,7 +103,7 @@ while True:
 EOF
 }
 
-# 2. 生成主监控脚本 (Bash, 强制数据清洗)
+# 2. 生成主监控脚本 (Bash, 极度偏执模式)
 create_monitor_script() {
     local url=$1
     local key=$2
@@ -132,41 +131,41 @@ log() {
   echo "\$(date '+%Y-%m-%d %H:%M:%S') - \$1"
 }
 
-# --- 数据采集函数 (增强版) ---
+# --- 数据采集函数 (Paranoid Mode) ---
+# 所有输出通过 tr -d '\n\r' 清洗，防止 JSON 断行
 
-# 读取 Ping 数据 (校验 JSON 完整性)
 get_ping_data() {
     local default='{"cu":0,"ct":0,"cm":0}'
     if [ -s "/tmp/vps_monitor_ping.json" ]; then
         local content=\$(cat "/tmp/vps_monitor_ping.json")
-        # 简单校验是否以 { 开头
-        if [[ "\$content" == \{* ]]; then
-            echo "\$content"
+        # 简单校验
+        if [[ "\$content" == \{*\} ]]; then
+            echo "\$content" | tr -d '\n\r'
             return
         fi
     fi
     echo "\$default"
 }
 
-# 获取 Uptime (强制清洗为数字)
 get_uptime() {
     local up=\$(cat /proc/uptime 2>/dev/null | awk '{print \$1}' | cut -d. -f1)
-    # 如果为空或者非数字，返回 0
     if [[ ! "\$up" =~ ^[0-9]+$ ]]; then
         echo "0"
     else
-        echo "\$up"
+        echo "\$up" | tr -d '\n\r'
     fi
 }
 
 get_cpu_usage() {
-    # 增加默认值防止 grep 失败
     local cpu_usage=\$(top -bn1 2>/dev/null | grep "Cpu(s)" | sed "s/.*, *\\([0-9.]*\\)%* id.*/\\1/" | awk '{print 100 - \$1}')
     local cpu_load=\$(cat /proc/loadavg 2>/dev/null | awk '{print \$1", "\$2", "\$3}')
     
-    # 清洗数据：如果为空设为 0
     cpu_usage=\${cpu_usage:-0}
     cpu_load=\${cpu_load:-"0, 0, 0"}
+    
+    # 组装前清洗
+    cpu_usage=\$(echo "\$cpu_usage" | tr -d '\n\r')
+    cpu_load=\$(echo "\$cpu_load" | tr -d '\n\r')
     
     echo "{\"usage_percent\":\$cpu_usage,\"load_avg\":[\$cpu_load]}"
 }
@@ -177,7 +176,6 @@ get_memory_usage() {
     local used=\$(echo "\$mem_info" | awk '{print \$3}')
     local free=\$(echo "\$mem_info" | awk '{print \$4}')
     
-    # 强制数字
     total=\${total:-0}
     used=\${used:-0}
     free=\${free:-0}
@@ -187,6 +185,12 @@ get_memory_usage() {
         usage_percent=\$(echo "scale=1; \$used * 100 / \$total" | bc 2>/dev/null)
     fi
     usage_percent=\${usage_percent:-0}
+    
+    # 清洗
+    total=\$(echo "\$total" | tr -d '\n\r')
+    used=\$(echo "\$used" | tr -d '\n\r')
+    free=\$(echo "\$free" | tr -d '\n\r')
+    usage_percent=\$(echo "\$usage_percent" | tr -d '\n\r')
     
     echo "{\"total\":\$total,\"used\":\$used,\"free\":\$free,\"usage_percent\":\$usage_percent}"
 }
@@ -203,6 +207,12 @@ get_disk_usage() {
     free=\${free:-0}
     usage_percent=\${usage_percent:-0}
     
+    # 清洗
+    total=\$(echo "\$total" | tr -d '\n\r')
+    used=\$(echo "\$used" | tr -d '\n\r')
+    free=\$(echo "\$free" | tr -d '\n\r')
+    usage_percent=\$(echo "\$usage_percent" | tr -d '\n\r')
+
     echo "{\"total\":\$total,\"used\":\$used,\"free\":\$free,\"usage_percent\":\$usage_percent}"
 }
 
@@ -218,15 +228,19 @@ get_network_usage() {
     local download=\$(echo "\$net_speed" | awk '{print \$1 * 1024}')
     local upload=\$(echo "\$net_speed" | awk '{print \$2 * 1024}')
     
-    # 关键修复：head -n 1
     local rx=\$(cat /proc/net/dev | grep "\$interface" | head -n 1 | awk '{print \$2}')
     local tx=\$(cat /proc/net/dev | grep "\$interface" | head -n 1 | awk '{print \$10}')
     
-    # 强制默认值
     download=\${download:-0}
     upload=\${upload:-0}
     rx=\${rx:-0}
     tx=\${tx:-0}
+    
+    # 清洗
+    download=\$(echo "\$download" | tr -d '\n\r')
+    upload=\$(echo "\$upload" | tr -d '\n\r')
+    rx=\$(echo "\$rx" | tr -d '\n\r')
+    tx=\$(echo "\$tx" | tr -d '\n\r')
     
     echo "{\"upload_speed\":\$upload,\"download_speed\":\$download,\"total_upload\":\$tx,\"total_download\":\$rx}"
 }
@@ -244,7 +258,7 @@ report_metrics() {
   ping=\$(get_ping_data)
   uptime=\$(get_uptime)
   
-  # 最终完整性检查：确保所有变量都不为空，否则会破坏 JSON 结构
+  # 兜底默认值
   if [ -z "\$cpu" ]; then cpu='{"usage_percent":0,"load_avg":[0,0,0]}'; fi
   if [ -z "\$memory" ]; then memory='{"total":0,"used":0,"free":0,"usage_percent":0}'; fi
   if [ -z "\$disk" ]; then disk='{"total":0,"used":0,"free":0,"usage_percent":0}'; fi
@@ -252,6 +266,7 @@ report_metrics() {
   if [ -z "\$ping" ]; then ping='{"cu":0,"ct":0,"cm":0}'; fi
   if [ -z "\$uptime" ]; then uptime=0; fi
   
+  # 组装 JSON
   data="{\"timestamp\":\$timestamp,\"cpu\":\$cpu,\"memory\":\$memory,\"disk\":\$disk,\"network\":\$network,\"ping\":\$ping,\"uptime\":\$uptime}"
   
   response=\$(curl -s -X POST "\$WORKER_URL/api/report/\$SERVER_ID" \
@@ -262,11 +277,12 @@ report_metrics() {
   if [[ "\$response" == *"success"* ]]; then
     log "数据上报成功"
   else
+    # 关键：故障现场记录！
     log "数据上报失败: \$response"
+    log "【调试】失败时的 JSON 数据: \$data"
   fi
 }
 
-# 修正后的依赖安装逻辑
 install_dependencies() {
   log "检查并安装依赖..."
   local pkg_manager=""
@@ -353,7 +369,6 @@ install_service() {
     mkdir -p "$INSTALL_DIR"
 
     echo -e "${SKYBLUE}> 安装依赖组件...${PLAIN}"
-    # 宿主脚本的依赖检查
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -y
         apt-get install -y curl python3 ifstat bc
