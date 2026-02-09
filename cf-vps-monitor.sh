@@ -304,7 +304,7 @@ install_dependencies() {
 }
 
 main() {
-  log "VPS监控脚本启动 (Strict Mode)"
+  log "VPS监控脚本启动 (Paranoid Mode)"
   install_dependencies
   nohup python3 "\$WORKDIR/ping_daemon.py" > /dev/null 2>&1 &
   while true; do
